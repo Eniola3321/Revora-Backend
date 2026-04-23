@@ -1,4 +1,9 @@
 import DistributionEngine, { BalanceRow } from './distributionEngine';
+import {
+  classifyStellarRPCFailure,
+  isStellarRPCRetryable,
+  StellarRPCFailureClass,
+} from '../lib/stellarRpcFailure';
 
 class MockDistributionRepo {
   public runs: any[] = [];
@@ -128,5 +133,123 @@ describe('DistributionEngine', () => {
 
     expect(result.distributionRun.id).toBe('run-1');
     expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '20.00' }]);
+  });
+
+  // ── Retry storm: exhausted budget throws, does not loop forever ────────────
+
+  it('throws after maxRetries exhausted on balance fetch', async () => {
+    const repo = new MockDistributionRepo();
+    let calls = 0;
+    const flakyProvider = {
+      getBalances: async () => { calls++; throw new Error('flaky'); },
+    };
+    const engine = new DistributionEngine(null, repo, flakyProvider, { maxRetries: 3, initialDelayMs: 0 });
+
+    await expect(
+      engine.distribute('off-5', { start: new Date(), end: new Date() }, 10),
+    ).rejects.toThrow('Failed to acquire balances after 3 attempts');
+
+    expect(calls).toBe(3); // exactly maxRetries, no infinite loop
+  });
+
+  it('throws after maxRetries exhausted on payout creation', async () => {
+    const repo = new MockDistributionRepo();
+    repo.failNextPayoutCount = 99; // always fail
+    const engine = new DistributionEngine(
+      null, repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 2, initialDelayMs: 0 },
+    );
+
+    await expect(
+      engine.distribute('off-6', { start: new Date(), end: new Date() }, 10),
+    ).rejects.toThrow('Failed to create payout for investor i1 after 2 attempts');
+  });
+
+  it('succeeds on last allowed retry (boundary)', async () => {
+    const repo = new MockDistributionRepo();
+    repo.failNextRunCount = 2; // fail twice, succeed on 3rd (maxRetries=3)
+    const engine = new DistributionEngine(
+      null, repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 3, initialDelayMs: 0 },
+    );
+
+    const result = await engine.distribute('off-7', { start: new Date(), end: new Date() }, 50);
+    expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '50.00' }]);
+  });
+
+  // ── Stellar result-code classification wired into distribution errors ──────
+
+  it('classifies a Stellar tx_bad_seq error as non-retryable TX_RESULT_CODE', () => {
+    const err = { status: 400, extras: { result_codes: { transaction: 'tx_bad_seq' } } };
+    expect(classifyStellarRPCFailure(err)).toBe(StellarRPCFailureClass.TX_RESULT_CODE);
+    expect(isStellarRPCRetryable(StellarRPCFailureClass.TX_RESULT_CODE)).toBe(false);
+  });
+
+  it('classifies a Stellar op_underfunded error as non-retryable OP_RESULT_CODE', () => {
+    const err = { status: 400, extras: { result_codes: { transaction: 'tx_failed', operations: ['op_underfunded'] } } };
+    expect(classifyStellarRPCFailure(err)).toBe(StellarRPCFailureClass.OP_RESULT_CODE);
+    expect(isStellarRPCRetryable(StellarRPCFailureClass.OP_RESULT_CODE)).toBe(false);
+  });
+
+  it('classifies a 503 upstream error as retryable', () => {
+    const err = { status: 503 };
+    expect(classifyStellarRPCFailure(err)).toBe(StellarRPCFailureClass.UPSTREAM_ERROR);
+    expect(isStellarRPCRetryable(StellarRPCFailureClass.UPSTREAM_ERROR)).toBe(true);
+  });
+
+  it('throws when offeringId is empty', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider([]), { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('', { start: new Date(), end: new Date() }, 10)).rejects.toThrow('offeringId is required');
+  });
+
+  it('throws when revenueAmount is zero', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider([{ investor_id: 'i1', balance: 1 }]), { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('off-x', { start: new Date(), end: new Date() }, 0)).rejects.toThrow('revenueAmount must be > 0');
+  });
+
+  it('throws when no investors found', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider([]), { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('off-x', { start: new Date(), end: new Date() }, 10)).rejects.toThrow('No investors or balances found');
+  });
+
+  it('uses offeringRepo.getInvestors when no balanceProvider', async () => {
+    const repo = new MockDistributionRepo();
+    const offeringRepo = { getInvestors: async () => [{ investor_id: 'i1', balance: 100 }] };
+    const engine = new DistributionEngine(offeringRepo, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
+    const result = await engine.distribute('off-8', { start: new Date(), end: new Date() }, 10);
+    expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '10.00' }]);
+  });
+
+  it('uses offeringRepo.listInvestors as fallback', async () => {
+    const repo = new MockDistributionRepo();
+    const offeringRepo = { listInvestors: async () => [{ investor_id: 'i2', balance: 50 }] };
+    const engine = new DistributionEngine(offeringRepo, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
+    const result = await engine.distribute('off-9', { start: new Date(), end: new Date() }, 20);
+    expect(result.payouts).toEqual([{ investor_id: 'i2', amount: '20.00' }]);
+  });
+
+  it('throws when no balance source is available', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('off-x', { start: new Date(), end: new Date() }, 10)).rejects.toThrow('Failed to acquire balances');
+  });
+
+  it('logs retries when logRetries is true', async () => {
+    const repo = new MockDistributionRepo();
+    repo.failNextRunCount = 1;
+    const spy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const engine = new DistributionEngine(
+      null, repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 2, initialDelayMs: 0, logRetries: true },
+    );
+    await engine.distribute('off-log', { start: new Date(), end: new Date() }, 5);
+    expect(spy).toHaveBeenCalledWith(expect.stringContaining('[DistributionEngine]'));
+    spy.mockRestore();
   });
 });
