@@ -50,7 +50,7 @@ export class RevenueHandler {
         next: NextFunction,
     ): Promise<void> => {
         try {
-            const requestId = req.id;
+            const requestId = req.requestId;
             const offeringId = req.params.id;
             const issuerId = req.user?.id;
 
@@ -102,7 +102,7 @@ export class RevenueHandler {
                 issuerId,
             });
 
-            return res.status(201).json({
+            res.status(201).json({
                 message: 'Revenue report submitted successfully',
                 data: report,
             });
@@ -110,7 +110,7 @@ export class RevenueHandler {
             if (error instanceof AppError) {
                 // Already a structured error, pass to error handler
                 this.logger.warn('Revenue submission validation error', {
-                    requestId: req.id,
+                    requestId: req.requestId,
                     errorCode: error.code,
                     message: error.message,
                 });
@@ -118,7 +118,7 @@ export class RevenueHandler {
             } else {
                 // Unexpected error, sanitize and pass to error handler
                 this.logger.error('Unexpected error during revenue submission', {
-                    requestId: req.id,
+                    requestId: req.requestId,
                     error: error instanceof Error ? error.message : String(error),
                 });
                 next(Errors.internal('An unexpected error occurred during revenue submission'));
@@ -142,7 +142,7 @@ export class RevenueHandler {
         next: NextFunction,
     ): Promise<void> => {
         try {
-            const requestId = req.id;
+            const requestId = req.requestId;
             const issuerId = req.user?.id;
 
             if (!issuerId) {
@@ -191,21 +191,21 @@ export class RevenueHandler {
                 issuerId,
             });
 
-            return res.status(201).json({
+            res.status(201).json({
                 message: 'Revenue report submitted successfully',
                 data: report,
             });
         } catch (error: unknown) {
             if (error instanceof AppError) {
                 this.logger.warn('Revenue submission validation error', {
-                    requestId: req.id,
+                    requestId: req.requestId,
                     errorCode: error.code,
                     message: error.message,
                 });
                 next(error);
             } else {
                 this.logger.error('Unexpected error during revenue submission', {
-                    requestId: req.id,
+                    requestId: req.requestId,
                     error: error instanceof Error ? error.message : String(error),
                 });
                 next(Errors.internal('An unexpected error occurred during revenue submission'));

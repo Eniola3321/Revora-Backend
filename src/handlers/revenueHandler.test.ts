@@ -28,7 +28,7 @@ describe('RevenueHandler', () => {
         overrides: Partial<AuthenticatedRequest> = {}
     ): AuthenticatedRequest {
         return {
-            id: 'req-123',
+            requestId: 'req-123',
             user: { id: 'issuer-1' },
             params: {},
             body: {},
@@ -108,7 +108,7 @@ describe('RevenueHandler', () => {
                 mockRes = makeResponse();
 
                 const req = makeAuthenticatedRequest({
-                    id: 'req-custom-456',
+                    requestId: 'req-custom-456',
                     params: { id: 'offering-1' },
                     body: {
                         amount: '500.50',
@@ -539,7 +539,7 @@ describe('RevenueHandler', () => {
             mockRevenueService.submitReport.mockResolvedValue({ id: 'report-1' } as any);
 
             const req = makeAuthenticatedRequest({
-                id: undefined,
+                requestId: undefined,
                 params: { id: 'offering-1' },
                 body: {
                     amount: '1000.00',
