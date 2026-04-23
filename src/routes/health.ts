@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response, Router } from 'express';
 import { Pool } from 'pg';
 import { AppError, Errors } from '../lib/errors';
+import { MetricsCollector } from '../lib/metrics';
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
@@ -38,11 +39,15 @@ export function mapHealthDependencyFailure(
 }
 
 export const healthReadyHandler =
-  (db: QueryableDb) =>
+  (db: QueryableDb, metrics?: MetricsCollector) =>
   async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const startTime = Date.now();
+
     try {
       await db.query('SELECT 1');
+      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'success' });
     } catch (dbError) {
+      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'failure' });
       next(mapHealthDependencyFailure('database', dbError));
       return;
     }
@@ -52,13 +57,19 @@ export const healthReadyHandler =
       const response = await fetch(horizonUrl);
 
       if (!response.ok) {
+        metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
         next(mapHealthDependencyFailure('stellar-horizon', { status: response.status }));
         return;
       }
+      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'success' });
     } catch (stellarError) {
+      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
       next(mapHealthDependencyFailure('stellar-horizon', stellarError));
       return;
     }
+
+    const duration = Date.now() - startTime;
+    metrics?.recordHistogram('health_check_duration_ms', duration, { endpoint: 'ready' });
 
     res.status(200).json({
       status: 'ok',
@@ -67,9 +78,9 @@ export const healthReadyHandler =
     });
   };
 
-export const createHealthRouter = (db: QueryableDb): Router => {
+export const createHealthRouter = (db: QueryableDb, metrics?: MetricsCollector): Router => {
   const router = Router();
-  router.get('/ready', healthReadyHandler(db));
+  router.get('/ready', healthReadyHandler(db, metrics));
   return router;
 };
 
