@@ -1,3 +1,7 @@
+import { globalLogger } from '../lib/logger';
+import { Errors } from '../lib/errors';
+import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+
 /**
  * @title DistributionEngine
  * @notice Computes per-investor payout amounts based on token balances and persists them.
@@ -6,6 +10,7 @@
  * 2. Proration of revenue based on balances
  * 3. Rounding adjustment to ensure total payout equals revenue amount
  * 4. Persistence of distribution runs and individual payouts with a retry strategy
+ * 5. Idempotency and at-least-once safety via resumption logic
  */
 
 export interface BalanceRow {
@@ -22,22 +27,13 @@ export interface DistributionEngineOptions {
   maxRetries?: number;
   initialDelayMs?: number;
   backoffFactor?: number;
-  /** Log retry attempts to console/logger */
-  logRetries?: boolean;
 }
 
 export class DistributionEngine {
   private readonly maxRetries: number;
   private readonly initialDelayMs: number;
   private readonly backoffFactor: number;
-  private readonly logRetries: boolean;
 
-  /**
-   * @param offeringRepo - should expose a method to list investors for offering (optional)
-   * @param distributionRepo - must expose `createDistributionRun` and `createPayout`
-   * @param balanceProvider - optional provider with `getBalances(offeringId, period)` returning BalanceRow[]
-   * @param options - retry configuration
-   */
   constructor(
     private offeringRepo: any,
     private distributionRepo: any,
@@ -47,63 +43,69 @@ export class DistributionEngine {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 500;
     this.backoffFactor = options.backoffFactor ?? 2;
-    this.logRetries = options.logRetries ?? false;
   }
 
   /**
    * @notice Distribute revenueAmount across investors for an offering and period.
-   * @dev Security Assumptions:
-   * - revenueAmount must be strictly positive.
-   * - offeringId must be valid and exist (checked by repo).
-   * - totalBalance must be > 0.
-   * - Payouts are persisted with a retry strategy to handle transient failures.
-   *
-   * @param offeringId The unique identifier of the offering
-   * @param period The timeframe for which the distribution is being made
-   * @param revenueAmount The total amount of revenue to be distributed
-   * @returns The created distribution run and the list of payouts
+   * @dev Implementation follows RC26Q2-B03 requirements:
+   * - Idempotent: checks for existing runs with same parameters.
+   * - Resumable: recovers from partial payout persistence failures.
+   * - Secure: uses structured logging and standardized errors.
    */
   async distribute(
     offeringId: string,
-    period: { start: Date; end: Date },
+    period: { id: string; start: Date; end: Date },
     revenueAmount: number
   ): Promise<DistributionResult> {
+    const logger = globalLogger.child({ offeringId, periodId: period.id, revenueAmount });
+    
     // 1. Validation
-    if (!offeringId) {
-      throw new Error('offeringId is required');
-    }
-    if (revenueAmount <= 0) {
-      throw new Error('revenueAmount must be > 0');
-    }
-    if (!period || !period.start || !period.end) {
-      throw new Error('Valid distribution period is required');
+    if (!offeringId) throw Errors.badRequest('offeringId is required');
+    if (revenueAmount <= 0) throw Errors.badRequest('revenueAmount must be > 0');
+    if (!period || !period.id || !period.end) throw Errors.badRequest('Valid distribution period with ID is required');
+
+    const amtStr = revenueAmount.toFixed(2);
+
+    // 2. Idempotency Check: Look for an existing run
+    let run = await this.distributionRepo.findRunByParams(offeringId, period.id, amtStr);
+    
+    if (run) {
+      if (run.status === 'completed') {
+        logger.info('Distribution already completed, returning cached results');
+        const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
+        return {
+          distributionRun: run,
+          payouts: existingPayouts.map((p: any) => ({ investor_id: p.investor_id, amount: p.amount })),
+        };
+      }
+      logger.info('Resuming partially completed distribution', { runId: run.id, currentStatus: run.status });
     }
 
-    // 2. Acquire balances with retry
+    // 3. Acquire balances with retry and classification
     let balances: BalanceRow[] = [];
     try {
       balances = await this.withRetry(() => this.fetchBalances(offeringId, period));
     } catch (err) {
-      throw new Error(`Failed to acquire balances after ${this.maxRetries} attempts: ${err instanceof Error ? err.message : String(err)}`);
+      const failureClass = classifyStellarRPCFailure(err);
+      logger.error('Failed to acquire balances', { error: err, failureClass });
+      throw Errors.serviceUnavailable(`Failed to acquire balances (${failureClass}): ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (!balances || balances.length === 0) {
-      throw new Error('No investors or balances found for offering');
+      throw Errors.badRequest('No investors or balances found for offering');
     }
 
-    // 3. Sum balances
+    // 4. Sum balances and compute shares
     const totalBalance = balances.reduce((s, b) => s + Number(b.balance), 0);
     if (totalBalance <= 0) {
-      throw new Error('Total balance must be > 0 to distribute revenue');
+      throw Errors.badRequest('Total balance must be > 0 to distribute revenue');
     }
 
-    // 4. Compute raw shares and round to 2 decimals (string amounts)
     const rawShares = balances.map((b) => ({
       investor_id: b.investor_id,
       raw: (Number(b.balance) / totalBalance) * revenueAmount,
     }));
 
-    // Round to cents and ensure sum equals revenueAmount by adjusting largest share
     const rounded = rawShares.map((r) => ({
       investor_id: r.investor_id,
       amount: Math.round(r.raw * 100) / 100,
@@ -113,7 +115,6 @@ export class DistributionEngine {
     const diff = Math.round((revenueAmount - roundedSum) * 100) / 100;
 
     if (Math.abs(diff) >= 0.01) {
-      // find index of largest provisional raw amount to absorb rounding diff
       let maxIdx = 0;
       for (let i = 1; i < rawShares.length; i++) {
         if (rawShares[i].raw > rawShares[maxIdx].raw) maxIdx = i;
@@ -121,43 +122,64 @@ export class DistributionEngine {
       rounded[maxIdx].amount = Math.round((rounded[maxIdx].amount + diff) * 100) / 100;
     }
 
-    // 5. Persist distribution run with retry
-    let run: any;
-    try {
-      run = await this.withRetry(() =>
-        this.distributionRepo.createDistributionRun({
-          offering_id: offeringId,
-          total_amount: revenueAmount.toFixed(2),
-          distribution_date: period.end,
-          status: 'processing',
-        })
-      );
-    } catch (err) {
-      throw new Error(`Failed to create distribution run after ${this.maxRetries} attempts: ${err instanceof Error ? err.message : String(err)}`);
+    // 5. Ensure distribution run exists and is in 'processing' state
+    if (!run) {
+      try {
+        run = await this.withRetry(() =>
+          this.distributionRepo.createDistributionRun({
+            offering_id: offeringId,
+            period_id: period.id,
+            total_amount: amtStr,
+            run_at: period.end,
+            status: 'processing',
+          })
+        );
+        logger.info('Created new distribution run', { runId: run.id });
+      } catch (err) {
+        logger.error('Failed to create distribution run', { error: err });
+        throw Errors.internal('Failed to initialize distribution run');
+      }
+    } else if (run.status !== 'processing') {
+      await this.distributionRepo.updateRunStatus(run.id, 'processing');
     }
 
-    // 6. Persist payouts with individual retries
-    const payouts: Array<{ investor_id: string; amount: string }> = [];
+    // 6. Persist payouts with resumption logic (at-least-once safety)
+    const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
+    const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
+
+    const finalPayouts: Array<{ investor_id: string; amount: string }> = [];
+
     for (const r of rounded) {
-      const amtStr = r.amount.toFixed(2);
+      const payoutAmtStr = r.amount.toFixed(2);
+      
+      if (existingInvestorIds.has(r.investor_id)) {
+        logger.debug('Payout already exists for investor, skipping', { investorId: r.investor_id });
+        finalPayouts.push({ investor_id: r.investor_id, amount: payoutAmtStr });
+        continue;
+      }
+
       try {
         await this.withRetry(() =>
           this.distributionRepo.createPayout({
-            distribution_run_id: run.id,
+            distribution_id: run.id,
             investor_id: r.investor_id,
-            amount: amtStr,
+            amount: payoutAmtStr,
             status: 'pending',
           })
         );
+        finalPayouts.push({ investor_id: r.investor_id, amount: payoutAmtStr });
       } catch (err) {
-        // Hardening: If an individual payout fails after all retries, we might want to mark the run as failed
-        // but for now we follow the requirement to be robust. We log and throw to let the caller handle it.
-        throw new Error(`Failed to create payout for investor ${r.investor_id} after ${this.maxRetries} attempts: ${err instanceof Error ? err.message : String(err)}`);
+        logger.error('Failed to create payout', { investorId: r.investor_id, error: err });
+        await this.distributionRepo.updateRunStatus(run.id, 'failed');
+        throw Errors.internal(`Failed to persist payout for investor ${r.investor_id}`);
       }
-      payouts.push({ investor_id: r.investor_id, amount: amtStr });
     }
 
-    return { distributionRun: run, payouts };
+    // 7. Finalize run
+    await this.distributionRepo.updateRunStatus(run.id, 'completed');
+    logger.info('Distribution run completed successfully', { runId: run.id, payoutCount: finalPayouts.length });
+
+    return { distributionRun: { ...run, status: 'completed' }, payouts: finalPayouts };
   }
 
   /**
@@ -165,7 +187,7 @@ export class DistributionEngine {
    */
   private async fetchBalances(offeringId: string, period: any): Promise<BalanceRow[]> {
     if (this.balanceProvider && typeof this.balanceProvider.getBalances === 'function') {
-      return await this.balanceProvider.getBalances(offeringId, period);
+      return await this.balanceProvider.getBalances(offeringId, period.id);
     } else if (this.offeringRepo && typeof this.offeringRepo.getInvestors === 'function') {
       return await this.offeringRepo.getInvestors(offeringId, period);
     } else if (this.offeringRepo && typeof this.offeringRepo.listInvestors === 'function') {
@@ -177,7 +199,6 @@ export class DistributionEngine {
 
   /**
    * Executes a function with exponential backoff retry strategy.
-   * @param fn The asynchronous function to execute
    */
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     let lastError: any;
@@ -187,17 +208,12 @@ export class DistributionEngine {
         return await fn();
       } catch (err) {
         lastError = err;
-
         if (attempt < this.maxRetries) {
           const delay = this.initialDelayMs * Math.pow(this.backoffFactor, attempt - 1);
-          if (this.logRetries) {
-            console.log(`[DistributionEngine] Retry attempt ${attempt} failed, retrying in ${delay}ms...`);
-          }
           await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
     }
-
     throw lastError;
   }
 }
