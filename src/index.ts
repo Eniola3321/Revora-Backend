@@ -8,6 +8,7 @@ import { requestIdMiddleware } from './middleware/requestId';
 import { Errors } from './lib/errors';
 import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellarRpcFailure';
 import { createHealthRouter } from './routes/health';
+import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
 
 const port = process.env.PORT ?? 3000;
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? '/api/v1';
@@ -574,6 +575,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   apiRouter.post(
     '/offerings/validation-matrix',
     requireOfferingAuth,
+    offeringSanitizeMiddleware,
     createOfferingValidationHandler(),
   );
 
