@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
+import { Errors } from '../lib/errors';
 
 type PrimitiveType = 'string' | 'number' | 'boolean';
 
@@ -127,8 +128,7 @@ function makeMiddleware(
     const data = pick(req);
     const result = validateObject(data, schema, locationName);
     if (!result.valid) {
-      res.status(400).json({ error: 'ValidationError', details: result.errors });
-      return;
+      return next(Errors.validationError('Invalid request parameters', result.errors));
     }
     next();
   };
