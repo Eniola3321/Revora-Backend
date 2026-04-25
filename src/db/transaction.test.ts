@@ -3,7 +3,6 @@ import {
   withTransaction,
   transactional,
   TransactionError,
-  TransactionOptions,
 } from './transaction';
 
 describe('Repository Transaction Boundaries', () => {
@@ -72,6 +71,38 @@ describe('Repository Transaction Boundaries', () => {
       });
 
       expect(result).toEqual({ id: '123', email: 'test@example.com' });
+    });
+
+    it('should call afterCommit callback after a successful commit', async () => {
+      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      const afterCommit = jest.fn().mockResolvedValue(undefined);
+
+      const result = await withTransaction(mockPool, async (client) => {
+        await client.query('INSERT INTO users (email) VALUES ($1)', ['test@example.com']);
+        return { success: true };
+      }, { afterCommit });
+
+      expect(result).toEqual({ success: true });
+      expect(mockClient.query).toHaveBeenCalledWith('COMMIT');
+      expect(afterCommit).toHaveBeenCalledWith({ success: true });
+      expect(mockClient.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('should propagate afterCommit failure after commit', async () => {
+      mockClient.query.mockResolvedValue({ rows: [], command: '', oid: 0, fields: [], rowCount: 0 });
+      const afterCommitError = new Error('External system call failed');
+      const afterCommit = jest.fn().mockRejectedValue(afterCommitError);
+
+      await expect(
+        withTransaction(mockPool, async (client) => {
+          await client.query('INSERT INTO users (email) VALUES ($1)', ['test@example.com']);
+          return { success: true };
+        }, { afterCommit })
+      ).rejects.toThrow('Transaction committed but post-commit action failed');
+
+      expect(afterCommit).toHaveBeenCalledWith({ success: true });
+      expect(mockClient.query).toHaveBeenCalledWith('COMMIT');
+      expect(mockClient.release).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -151,7 +182,7 @@ describe('Repository Transaction Boundaries', () => {
         expect(error).toBeInstanceOf(TransactionError);
         expect((error as TransactionError).rollbackSucceeded).toBe(false);
         expect(consoleErrorSpy).toHaveBeenCalledWith(
-          expect.stringContaining('[transaction] Rollback failed:')
+          expect.stringContaining('Rollback failed')
         );
       }
 
