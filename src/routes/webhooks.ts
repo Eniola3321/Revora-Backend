@@ -1,6 +1,8 @@
 import { Router, Request, Response, raw } from 'express';
 import { webhookAuth, WebhookAuthenticatedRequest } from '../middleware/webhookAuth';
 import { verifyWebhookPayload } from '../lib/webhookSignature';
+import { Logger } from '../lib/logger';
+import { Errors } from '../lib/errors';
 
 /**
  * @title Webhook Receiver Routes
@@ -51,17 +53,19 @@ export type WebhookEventHandler = (event: WebhookEvent) => Promise<WebhookProces
 /**
  * @notice Default webhook event handler that logs events.
  */
-const defaultEventHandler: WebhookEventHandler = async (event: WebhookEvent) => {
-  // eslint-disable-next-line no-console
-  console.log(`[Webhook] Received event: ${event.event}`, {
-    id: event.id,
-    timestamp: event.timestamp,
-  });
+const createDefaultEventHandler = (logger: Logger): WebhookEventHandler => {
+  return async (event: WebhookEvent) => {
+    logger.info('Webhook event received', {
+      eventId: event.id,
+      eventType: event.event,
+      timestamp: event.timestamp,
+    });
 
-  return {
-    success: true,
-    eventId: event.id,
-    message: `Event ${event.event} processed successfully`,
+    return {
+      success: true,
+      eventId: event.id,
+      message: `Event ${event.event} processed successfully`,
+    };
   };
 };
 
@@ -81,6 +85,8 @@ export interface WebhookRouterConfig {
   maxPayloadSize?: number;
   /** Custom webhook endpoint path (default: '/webhooks') */
   path?: string;
+  /** Logger instance for structured logging */
+  logger?: Logger;
 }
 
 /**
@@ -152,12 +158,13 @@ function validateWebhookEvent(body: unknown): { valid: boolean; error?: string; 
 export function createWebhookRouter(config: WebhookRouterConfig): Router {
   const {
     secret,
-    eventHandler = defaultEventHandler,
     requireTimestamp = true,
     maxAgeMs = 5 * 60 * 1000, // 5 minutes
     maxPayloadSize = 1024 * 1024, // 1MB
+    logger = new Logger({ serviceName: 'webhook-router' }),
   } = config;
 
+  const eventHandler = config.eventHandler ?? createDefaultEventHandler(logger);
   const router = Router();
 
   // Apply raw body parser for signature verification
@@ -236,10 +243,16 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
       }
     },
     async (req: Request, res: Response): Promise<void> => {
+      const requestId = req.headers['x-request-id'] as string | undefined;
+      
       try {
         // Validate event structure
         const validation = validateWebhookEvent(req.body);
         if (!validation.valid) {
+          logger.warn('Invalid webhook event structure', {
+            requestId,
+            validationError: validation.error,
+          });
           res.status(400).json({
             success: false,
             error: 'Invalid webhook event structure',
@@ -251,10 +264,21 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
         const event = validation.event!;
         const authReq = req as WebhookAuthenticatedRequest;
 
+        logger.info('Processing webhook event', {
+          requestId,
+          eventId: event.id,
+          eventType: event.event,
+        });
+
         // Process the event
         const result = await eventHandler(event);
 
         if (result.success) {
+          logger.info('Webhook event processed successfully', {
+            requestId,
+            eventId: event.id,
+            eventType: event.event,
+          });
           res.status(200).json({
             success: true,
             eventId: result.eventId || event.id,
@@ -263,6 +287,12 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
             verifiedAt: authReq.webhook?.timestamp?.toISOString(),
           });
         } else {
+          logger.warn('Webhook event processing failed', {
+            requestId,
+            eventId: event.id,
+            eventType: event.event,
+            message: result.message,
+          });
           res.status(422).json({
             success: false,
             eventId: event.id,
@@ -271,13 +301,15 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
           });
         }
       } catch (error) {
-        // eslint-disable-next-line no-console
-        console.error('[Webhook] Error processing webhook:', error);
+        logger.error('Error processing webhook', {
+          requestId,
+          error,
+        });
 
         res.status(500).json({
           success: false,
           error: 'Internal server error',
-          message: error instanceof Error ? error.message : 'Unknown error',
+          message: 'An unexpected error occurred',
         });
       }
     }
