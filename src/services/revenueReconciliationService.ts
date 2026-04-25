@@ -10,6 +10,18 @@ import { Pool } from 'pg';
 import { RevenueReportRepository, RevenueReport } from '../db/repositories/revenueReportRepository';
 import { DistributionRepository, DistributionRun, Payout } from '../db/repositories/distributionRepository';
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
+import { OfferingRepository } from '../db/repositories/offeringRepository';
+import { logger } from '../lib/logger';
+import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+import { Errors } from '../lib/errors';
+
+export interface OnChainRevenueState {
+  totalDistributed: string;
+}
+
+export interface StellarRevenueClient {
+  getRevenueState(contractAddress: string): Promise<OnChainRevenueState>;
+}
 
 export interface ReconciliationDiscrepancy {
   type: DiscrepancyType;
@@ -30,7 +42,9 @@ export type DiscrepancyType =
   | 'DUPLICATE_PAYOUT'
   | 'OVERPAYMENT'
   | 'UNDERPAMENT'
-  | 'DISTRIBUTION_STATUS_INVALID';
+  | 'DISTRIBUTION_STATUS_INVALID'
+  | 'CHAIN_DRIFT_DETECTED'
+  | 'RPC_ERROR';
 
 export interface ReconciliationResult {
   offeringId: string;
@@ -49,6 +63,11 @@ export interface ReconciliationSummary {
   investorCount: number;
   payoutsProcessed: number;
   payoutsFailed: number;
+  chainDrift?: {
+    onChainAmount: string;
+    localAmount: string;
+    drift: string;
+  };
 }
 
 export interface RevenueReconciliationOptions {
@@ -60,14 +79,16 @@ export interface RevenueReconciliationOptions {
 const DEFAULT_TOLERANCE = 0.01;
 
 export class RevenueReconciliationService {
-  private readonly revenueReportRepo: RevenueReportRepository;
-  private readonly distributionRepo: DistributionRepository;
-  private readonly investmentRepo: InvestmentRepository;
+  private readonly offeringRepo: OfferingRepository;
 
-  constructor(private readonly db: Pool) {
+  constructor(
+    private readonly db: Pool,
+    private readonly stellarClient?: StellarRevenueClient
+  ) {
     this.revenueReportRepo = new RevenueReportRepository(db);
     this.distributionRepo = new DistributionRepository(db);
     this.investmentRepo = new InvestmentRepository(db);
+    this.offeringRepo = new OfferingRepository(db);
   }
 
   /**
@@ -108,6 +129,42 @@ export class RevenueReconciliationService {
     );
     if (revenueMismatch) {
       discrepancies.push(revenueMismatch);
+    }
+
+    // Drift Detection
+    if (this.stellarClient) {
+      try {
+        const driftResult = await this.detectChainDrift(offeringId);
+        if (driftResult.hasDrift) {
+          discrepancies.push({
+            type: 'CHAIN_DRIFT_DETECTED',
+            severity: parseFloat(driftResult.drift) > tolerance * 10 ? 'critical' : 'error',
+            message: `On-chain drift detected for offering ${offeringId}: local ${driftResult.localAmount} vs chain ${driftResult.onChainAmount}`,
+            details: driftResult,
+            offeringId,
+          });
+
+          logger.error('Revenue reconciliation drift detected', {
+            offeringId,
+            ...driftResult,
+          });
+        }
+      } catch (error) {
+        const failureClass = classifyStellarRPCFailure(error);
+        discrepancies.push({
+          type: 'RPC_ERROR',
+          severity: 'warning',
+          message: `Failed to fetch on-chain state: ${failureClass}`,
+          details: { error: String(error), failureClass },
+          offeringId,
+        });
+
+        logger.warn('Failed to fetch on-chain state during reconciliation', {
+          offeringId,
+          failureClass,
+          error: String(error),
+        });
+      }
     }
 
     for (const run of relevantRuns) {
@@ -164,6 +221,7 @@ export class RevenueReconciliationService {
         investorCount: investorIds.size,
         payoutsProcessed: this.countProcessedPayouts(relevantRuns),
         payoutsFailed: totalFailedPayouts,
+        chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
       },
       checkedAt: new Date(),
     };
@@ -263,6 +321,46 @@ export class RevenueReconciliationService {
     return {
       isValid: errors.length === 0,
       errors,
+    };
+  }
+
+  /**
+   * Detect drift between local DB and on-chain state
+   */
+  async detectChainDrift(offeringId: string): Promise<{
+    hasDrift: boolean;
+    onChainAmount: string;
+    localAmount: string;
+    drift: string;
+  }> {
+    if (!this.stellarClient) {
+      throw Errors.internal('Stellar client not configured for drift detection');
+    }
+
+    const offering = await this.offeringRepo.findById(offeringId);
+    if (!offering || !offering.contract_address) {
+      return {
+        hasDrift: false,
+        onChainAmount: '0.00',
+        localAmount: '0.00',
+        drift: '0.00',
+      };
+    }
+
+    const onChainState = await this.stellarClient.getRevenueState(offering.contract_address);
+    const stats = await this.distributionRepo.getAggregateStats(offeringId);
+
+    const onChainAmount = parseFloat(onChainState.totalDistributed);
+    const localAmount = parseFloat(stats.totalDistributed);
+    const drift = Math.abs(onChainAmount - localAmount);
+
+    const hasDrift = drift > DEFAULT_TOLERANCE;
+
+    return {
+      hasDrift,
+      onChainAmount: onChainAmount.toFixed(2),
+      localAmount: localAmount.toFixed(2),
+      drift: drift.toFixed(2),
     };
   }
 
