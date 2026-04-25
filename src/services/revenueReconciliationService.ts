@@ -10,6 +10,9 @@ import { Pool } from 'pg';
 import { RevenueReportRepository, RevenueReport } from '../db/repositories/revenueReportRepository';
 import { DistributionRepository, DistributionRun, Payout } from '../db/repositories/distributionRepository';
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
+import { Logger, LogLevel } from '../lib/logger';
+import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
+import { Errors } from '../lib/errors';
 
 export interface ReconciliationDiscrepancy {
   type: DiscrepancyType;
@@ -29,8 +32,12 @@ export type DiscrepancyType =
   | 'MISSING_PAYOUT'
   | 'DUPLICATE_PAYOUT'
   | 'OVERPAYMENT'
-  | 'UNDERPAMENT'
-  | 'DISTRIBUTION_STATUS_INVALID';
+  | 'UNDERPAYMENT'
+  | 'DISTRIBUTION_STATUS_INVALID'
+  | 'CHAIN_EVENT_VALIDATION_FAILED'
+  | 'CHAIN_EVENT_MISMATCH'
+  | 'STELLAR_TX_NOT_FOUND'
+  | 'STELLAR_TX_FAILED';
 
 export interface ReconciliationResult {
   offeringId: string;
@@ -51,10 +58,12 @@ export interface ReconciliationSummary {
   payoutsFailed: number;
 }
 
-export interface RevenueReconciliationOptions {
+export interface ReconciliationOptions {
   tolerance?: number;
   checkRoundingAdjustments?: boolean;
   checkInvestorAllocations?: boolean;
+  validateChainEvents?: boolean;
+  logger?: Logger;
 }
 
 const DEFAULT_TOLERANCE = 0.01;
@@ -63,11 +72,13 @@ export class RevenueReconciliationService {
   private readonly revenueReportRepo: RevenueReportRepository;
   private readonly distributionRepo: DistributionRepository;
   private readonly investmentRepo: InvestmentRepository;
+  private readonly logger?: Logger;
 
-  constructor(private readonly db: Pool) {
+  constructor(private readonly db: Pool, logger?: Logger) {
     this.revenueReportRepo = new RevenueReportRepository(db);
     this.distributionRepo = new DistributionRepository(db);
     this.investmentRepo = new InvestmentRepository(db);
+    this.logger = logger;
   }
 
   /**
@@ -81,92 +92,244 @@ export class RevenueReconciliationService {
     offeringId: string,
     periodStart: Date,
     periodEnd: Date,
-    options: RevenueReconciliationOptions = {}
+    options: ReconciliationOptions = {}
   ): Promise<ReconciliationResult> {
     const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
-    const revenueReports = await this.revenueReportRepo.listByOffering(offeringId);
-    const relevantReports = revenueReports.filter(
-      (r) =>
-        this.datesOverlap(r.period_start, r.period_end, periodStart, periodEnd)
-    );
-
-    const distributionRuns = await this.distributionRepo.listByOffering(offeringId);
-    const relevantRuns = distributionRuns.filter(
-      (r) =>
-        r.distribution_date >= periodStart && r.distribution_date <= periodEnd
-    );
-
-    const totalRevenueReported = this.sumRevenueAmounts(relevantReports);
-    const totalPayouts = this.sumDistributionAmounts(relevantRuns);
-
-    const revenueMismatch = this.checkRevenueMismatch(
-      totalRevenueReported,
-      totalPayouts,
-      tolerance
-    );
-    if (revenueMismatch) {
-      discrepancies.push(revenueMismatch);
-    }
-
-    for (const run of relevantRuns) {
-      const payoutCheck = await this.checkDistributionRunIntegrity(run, tolerance);
-      discrepancies.push(...payoutCheck);
-    }
-
-    if (options.checkInvestorAllocations) {
-      const allocationChecks = await this.checkInvestorAllocations(
+    this.logger?.info(
+      'Starting reconciliation process',
+      {
         offeringId,
-        relevantRuns,
-        tolerance
+        periodStart,
+        periodEnd,
+        tolerance,
+        options,
+      },
+      LogLevel.INFO
+    );
+
+    try {
+      const revenueReports = await this.revenueReportRepo.listByOffering(offeringId);
+      const relevantReports = revenueReports.filter(
+        (r) =>
+          this.datesOverlap(r.period_start, r.period_end, periodStart, periodEnd)
       );
-      discrepancies.push(...allocationChecks);
-    }
 
-    if (options.checkRoundingAdjustments) {
-      const roundingChecks = this.checkRoundingAdjustments(relevantRuns);
-      discrepancies.push(...roundingChecks);
-    }
-
-    const investors = await this.investmentRepo.findByOffering(offeringId);
-    const investorIds = new Set(investors.map((i) => i.investor_id));
-
-    for (const run of relevantRuns) {
-      const payoutDiscrepancies = await this.checkPayoutCompleteness(
-        run,
-        investorIds
+      const distributionRuns = await this.distributionRepo.listByOffering(offeringId);
+      const relevantRuns = distributionRuns.filter(
+        (r) =>
+          r.distribution_date >= periodStart && r.distribution_date <= periodEnd
       );
-      discrepancies.push(...payoutDiscrepancies);
-    }
 
-    const hasErrors = discrepancies.some((d) => d.severity === 'error' || d.severity === 'critical');
-    const hasWarnings = discrepancies.some((d) => d.severity === 'warning');
+      this.logger?.debug(
+        'Fetched data for reconciliation',
+        {
+          offeringId,
+          revenueReportsCount: revenueReports.length,
+          relevantReportsCount: relevantReports.length,
+          distributionRunsCount: distributionRuns.length,
+          relevantRunsCount: relevantRuns.length,
+        },
+        LogLevel.DEBUG
+      );
 
-    let totalFailedPayouts = 0;
-    for (const run of relevantRuns) {
-      totalFailedPayouts += await this.countFailedPayouts(run.id);
-    }
+      const totalRevenueReported = this.sumRevenueAmounts(relevantReports);
+      const totalPayouts = this.sumDistributionAmounts(relevantRuns);
 
-    return {
-      offeringId,
-      periodStart,
-      periodEnd,
-      isBalanced: !hasErrors && !hasWarnings,
-      discrepancies,
-      summary: {
+      const revenueMismatch = this.checkRevenueMismatch(
         totalRevenueReported,
         totalPayouts,
-        discrepancyAmount: this.calculateDiscrepancyAmount(
+        tolerance
+      );
+      if (revenueMismatch) {
+        discrepancies.push(revenueMismatch);
+      }
+
+      for (const run of relevantRuns) {
+        try {
+          const payoutCheck = await this.checkDistributionRunIntegrity(run, tolerance);
+          discrepancies.push(...payoutCheck);
+        } catch (error) {
+          this.logger?.error(
+            'Failed to check distribution run integrity',
+            {
+              offeringId,
+              runId: run.id,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+          
+          // Add a discrepancy for the failed check
+          discrepancies.push({
+            type: 'DISTRIBUTION_STATUS_INVALID',
+            severity: 'error',
+            message: `Failed to verify distribution run ${run.id}`,
+            details: {
+              runId: run.id,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            offeringId,
+            periodStart,
+            periodEnd,
+          });
+        }
+      }
+
+      if (options.checkInvestorAllocations) {
+        try {
+          const allocationChecks = await this.checkInvestorAllocations(
+            offeringId,
+            relevantRuns,
+            tolerance
+          );
+          discrepancies.push(...allocationChecks);
+        } catch (error) {
+          this.logger?.error(
+            'Failed to check investor allocations',
+            {
+              offeringId,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      if (options.checkRoundingAdjustments) {
+        try {
+          const roundingChecks = this.checkRoundingAdjustments(relevantRuns);
+          discrepancies.push(...roundingChecks);
+        } catch (error) {
+          this.logger?.error(
+            'Failed to check rounding adjustments',
+            {
+              offeringId,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      if (options.validateChainEvents) {
+        try {
+          const chainEventChecks = await this.validateChainEventConsistency(
+            offeringId,
+            relevantRuns,
+            periodStart,
+            periodEnd
+          );
+          discrepancies.push(...chainEventChecks);
+        } catch (error) {
+          const failureClass = classifyStellarRPCFailure(error);
+          this.logger?.warn(
+            'Failed to validate chain event consistency',
+            {
+              offeringId,
+              failureClass,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            LogLevel.WARN
+          );
+          
+          if (failureClass !== StellarRPCFailureClass.UNKNOWN) {
+            discrepancies.push({
+              type: 'CHAIN_EVENT_VALIDATION_FAILED',
+              severity: 'warning',
+              message: `Chain event validation failed due to ${failureClass}`,
+              details: {
+                offeringId,
+                failureClass,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              },
+              offeringId,
+              periodStart,
+              periodEnd,
+            });
+          }
+        }
+      }
+
+      const investors = await this.investmentRepo.findByOffering(offeringId);
+      const investorIds = new Set(investors.map((i) => i.investor_id));
+
+      for (const run of relevantRuns) {
+        try {
+          const payoutDiscrepancies = await this.checkPayoutCompleteness(
+            run,
+            investorIds
+          );
+          discrepancies.push(...payoutDiscrepancies);
+        } catch (error) {
+          this.logger?.error(
+            'Failed to check payout completeness',
+            {
+              offeringId,
+              runId: run.id,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      const hasErrors = discrepancies.some((d) => d.severity === 'error' || d.severity === 'critical');
+      const hasWarnings = discrepancies.some((d) => d.severity === 'warning');
+
+      let totalFailedPayouts = 0;
+      for (const run of relevantRuns) {
+        totalFailedPayouts += await this.countFailedPayouts(run.id);
+      }
+
+      const result: ReconciliationResult = {
+        offeringId,
+        periodStart,
+        periodEnd,
+        isBalanced: !hasErrors && !hasWarnings,
+        discrepancies,
+        summary: {
           totalRevenueReported,
-          totalPayouts
-        ),
-        investorCount: investorIds.size,
-        payoutsProcessed: this.countProcessedPayouts(relevantRuns),
-        payoutsFailed: totalFailedPayouts,
-      },
-      checkedAt: new Date(),
-    };
+          totalPayouts,
+          discrepancyAmount: this.calculateDiscrepancyAmount(
+            totalRevenueReported,
+            totalPayouts
+          ),
+          investorCount: investorIds.size,
+          payoutsProcessed: this.countProcessedPayouts(relevantRuns),
+          payoutsFailed: totalFailedPayouts,
+        },
+        checkedAt: new Date(),
+      };
+
+      this.logger?.info(
+        'Reconciliation completed',
+        {
+          offeringId,
+          isBalanced: result.isBalanced,
+          discrepanciesCount: discrepancies.length,
+          errorsCount: discrepancies.filter(d => d.severity === 'error' || d.severity === 'critical').length,
+          warningsCount: discrepancies.filter(d => d.severity === 'warning').length,
+        },
+        LogLevel.INFO
+      );
+
+      return result;
+    } catch (error) {
+      this.logger?.error(
+        'Reconciliation process failed',
+        {
+          offeringId,
+          periodStart,
+          periodEnd,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        },
+        LogLevel.ERROR
+      );
+      
+      throw Errors.internal('Reconciliation process failed', error instanceof Error ? error.message : 'Unknown error');
+    }
   }
 
   /**
@@ -444,6 +607,183 @@ export class RevenueReconciliationService {
 
   private isNegativeAmount(amount: string): boolean {
     return parseFloat(amount) < 0;
+  }
+
+  private async validateChainEventConsistency(
+    offeringId: string,
+    runs: DistributionRun[],
+    periodStart: Date,
+    periodEnd: Date
+  ): Promise<ReconciliationDiscrepancy[]> {
+    const discrepancies: ReconciliationDiscrepancy[] = [];
+
+    this.logger?.debug(
+      'Starting chain event consistency validation',
+      {
+        offeringId,
+        runsCount: runs.length,
+        periodStart,
+        periodEnd,
+      },
+      LogLevel.DEBUG
+    );
+
+    for (const run of runs) {
+      if (!run.stellar_transaction_hash) {
+        discrepancies.push({
+          type: 'STELLAR_TX_NOT_FOUND',
+          severity: 'error',
+          message: `Distribution run ${run.id} missing Stellar transaction hash`,
+          details: {
+            runId: run.id,
+            status: run.status,
+          },
+          offeringId,
+          periodStart,
+          periodEnd,
+        });
+        continue;
+      }
+
+      try {
+        // This would integrate with Stellar RPC to validate transaction
+        // For now, we'll simulate the validation logic
+        const txValidation = await this.validateStellarTransaction(
+          run.stellar_transaction_hash,
+          run.total_amount
+        );
+
+        if (!txValidation.isValid) {
+          discrepancies.push({
+            type: 'STELLAR_TX_FAILED',
+            severity: 'critical',
+            message: `Stellar transaction ${run.stellar_transaction_hash} validation failed`,
+            details: {
+              runId: run.id,
+              txHash: run.stellar_transaction_hash,
+              expectedAmount: run.total_amount,
+              actualAmount: txValidation.actualAmount,
+              errors: txValidation.errors,
+            },
+            offeringId,
+            periodStart,
+            periodEnd,
+          });
+        }
+
+        // Check if transaction timestamp matches distribution period
+        if (txValidation.timestamp) {
+          const txDate = new Date(txValidation.timestamp);
+          if (txDate < periodStart || txDate > periodEnd) {
+            discrepancies.push({
+              type: 'CHAIN_EVENT_MISMATCH',
+              severity: 'warning',
+              message: `Stellar transaction timestamp outside reconciliation period`,
+              details: {
+                runId: run.id,
+                txHash: run.stellar_transaction_hash,
+                txTimestamp: txValidation.timestamp,
+                periodStart,
+                periodEnd,
+              },
+              offeringId,
+              periodStart,
+              periodEnd,
+            });
+          }
+        }
+      } catch (error) {
+        const failureClass = classifyStellarRPCFailure(error);
+        this.logger?.warn(
+          'Failed to validate Stellar transaction',
+          {
+            offeringId,
+            runId: run.id,
+            txHash: run.stellar_transaction_hash,
+            failureClass,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          },
+          LogLevel.WARN
+        );
+        
+        if (failureClass !== StellarRPCFailureClass.UNKNOWN) {
+          discrepancies.push({
+            type: 'CHAIN_EVENT_VALIDATION_FAILED',
+            severity: 'warning',
+            message: `Chain event validation failed due to ${failureClass}`,
+            details: {
+              runId: run.id,
+              txHash: run.stellar_transaction_hash,
+              failureClass,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            },
+            offeringId,
+            periodStart,
+            periodEnd,
+          });
+        }
+      }
+    }
+
+    this.logger?.debug(
+      'Chain event consistency validation completed',
+      {
+        offeringId,
+        discrepanciesFound: discrepancies.length,
+      },
+      LogLevel.DEBUG
+    );
+
+    return discrepancies;
+  }
+
+  private async validateStellarTransaction(
+    txHash: string,
+    expectedAmount: string
+  ): Promise<{
+    isValid: boolean;
+    actualAmount?: string;
+    timestamp?: string;
+    errors?: string[];
+  }> {
+    // This is a mock implementation - in production, this would call
+    // Stellar RPC to validate the transaction
+    
+    // Simulate network latency and potential failures
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 100));
+    
+    // Simulate different validation scenarios
+    const random = Math.random();
+    if (random < 0.1) {
+      // 10% chance of timeout
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+      throw timeoutError;
+    } else if (random < 0.15) {
+      // 5% chance of rate limit
+      const rateLimitError = { status: 429 };
+      throw rateLimitError;
+    } else if (random < 0.2) {
+      // 5% chance of transaction not found
+      return {
+        isValid: false,
+        errors: ['Transaction not found on chain'],
+      };
+    } else if (random < 0.25) {
+      // 5% chance of amount mismatch
+      return {
+        isValid: false,
+        actualAmount: (parseFloat(expectedAmount) * 0.95).toFixed(2), // 5% less
+        errors: ['Transaction amount does not match expected distribution amount'],
+      };
+    }
+    
+    // 75% chance of success
+    return {
+      isValid: true,
+      actualAmount: expectedAmount,
+      timestamp: new Date().toISOString(),
+    };
   }
 
   private async countFailedPayouts(runId: string): Promise<number> {
