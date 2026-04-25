@@ -151,8 +151,7 @@ describe('Repository Transaction Boundaries', () => {
         expect(error).toBeInstanceOf(TransactionError);
         expect((error as TransactionError).rollbackSucceeded).toBe(false);
         expect(consoleErrorSpy).toHaveBeenCalledWith(
-          '[transaction] Rollback failed:',
-          expect.any(String)
+          expect.stringContaining('[transaction] Rollback failed:')
         );
       }
 

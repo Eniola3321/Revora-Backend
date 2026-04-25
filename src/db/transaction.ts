@@ -156,10 +156,7 @@ export async function withTransaction<T>(
       } catch (rollbackError) {
         rollbackSucceeded = false;
         // Log rollback failure but throw original error
-        // Using process.stderr instead of console for Node.js compatibility
-        if (typeof process !== 'undefined' && process.stderr) {
-          process.stderr.write(`[transaction] Rollback failed: ${sanitizeError(rollbackError)}\n`);
-        }
+        console.error(`[transaction] Rollback failed: ${sanitizeError(rollbackError)}`);
       }
     }
 
