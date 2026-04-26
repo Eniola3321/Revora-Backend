@@ -1,5 +1,5 @@
-import express from 'express';
-import request from 'supertest';
+import express from "express";
+import request from "supertest";
 import {
   __test,
   classifyStellarRPCFailure,
@@ -9,940 +9,41 @@ import {
 } from '../index';
 import { closePool } from '../db/client';
 import { ErrorCode } from '../lib/errors';
+import { MetricsCollector } from '../lib/metrics';
 import {
   calculateLag,
   calculateUptimeSeconds,
   createHealthRouter,
-  determineHealthStatus,
-  getHealthLagThreshold,
-  getIndexerStartTime,
+  healthLiveHandler,
   healthReadyHandler,
-  INDEXER_START_TIME,
+  healthRootHandler,
+  healthStartupHandler,
   mapHealthDependencyFailure,
-} from './health';
+  HealthDependencyGraph,
+  DependencyHealth,
+} from "./health";
 
 afterAll(async () => {
   await closePool();
 });
 
-describe('calculateLag', () => {
-  it('calculates correct lag when indexer is behind', () => {
-    const result = calculateLag(1000, 950);
-    
-    expect(result.lagLedgers).toBe(50);
-    expect(result.lagSeconds).toBe(250); // 50 * 5 seconds
+describe("classifyStellarRPCFailure", () => {
+  it("classifies timeout failures", () => {
+    const error = new Error("network timeout");
+    error.name = "AbortError";
+
+    expect(classifyStellarRPCFailure(error)).toBe(
+      StellarRPCFailureClass.TIMEOUT,
+    );
   });
 
-  it('returns zero lag when indexer is caught up', () => {
-    const result = calculateLag(1000, 1000);
-    
-    expect(result.lagLedgers).toBe(0);
-    expect(result.lagSeconds).toBe(0);
-  });
-
-  it('clamps negative lag to zero when last indexed is ahead', () => {
-    const result = calculateLag(900, 1000);
-    
-    expect(result.lagLedgers).toBe(0);
-    expect(result.lagSeconds).toBe(0);
-  });
-
-  it('handles large lag values correctly', () => {
-    const result = calculateLag(1000000, 500000);
-    
-    expect(result.lagLedgers).toBe(500000);
-    expect(result.lagSeconds).toBe(2500000); // 500000 * 5 seconds
-  });
-
-  it('handles zero ledger values', () => {
-    const result = calculateLag(0, 0);
-    
-    expect(result.lagLedgers).toBe(0);
-    expect(result.lagSeconds).toBe(0);
-  });
-
-  it('calculates lag of exactly one ledger', () => {
-    const result = calculateLag(1001, 1000);
-    
-    expect(result.lagLedgers).toBe(1);
-    expect(result.lagSeconds).toBe(5);
-  });
-
-  it('uses 5-second ledger close time constant', () => {
-    // Verify the 5-second constant is used correctly
-    const result = calculateLag(100, 90);
-    
-    expect(result.lagSeconds).toBe(result.lagLedgers * 5);
-  });
-});
-
-describe('determineHealthStatus', () => {
-  it('returns "ok" when lag is below threshold and no errors', () => {
-    const status = determineHealthStatus(50, 100, false);
-    
-    expect(status).toBe('ok');
-  });
-
-  it('returns "ok" when lag equals threshold and no errors', () => {
-    const status = determineHealthStatus(100, 100, false);
-    
-    expect(status).toBe('ok');
-  });
-
-  it('returns "degraded" when lag exceeds threshold', () => {
-    const status = determineHealthStatus(150, 100, false);
-    
-    expect(status).toBe('degraded');
-  });
-
-  it('returns "degraded" when hasErrors is true regardless of lag', () => {
-    const status = determineHealthStatus(10, 100, true);
-    
-    expect(status).toBe('degraded');
-  });
-
-  it('returns "degraded" when hasErrors is true even with zero lag', () => {
-    const status = determineHealthStatus(0, 100, true);
-    
-    expect(status).toBe('degraded');
-  });
-
-  it('returns "ok" when lag is zero and no errors', () => {
-    const status = determineHealthStatus(0, 100, false);
-    
-    expect(status).toBe('ok');
-  });
-
-  it('handles custom threshold values correctly', () => {
-    expect(determineHealthStatus(200, 200, false)).toBe('ok');
-    expect(determineHealthStatus(201, 200, false)).toBe('degraded');
-  });
-
-  it('handles very large lag values', () => {
-    const status = determineHealthStatus(1000000, 100, false);
-    
-    expect(status).toBe('degraded');
-  });
-});
-
-describe('getHealthLagThreshold', () => {
-  const originalEnv = process.env.HEALTH_LAG_THRESHOLD;
-
-  afterEach(() => {
-    if (originalEnv !== undefined) {
-      process.env.HEALTH_LAG_THRESHOLD = originalEnv;
-    } else {
-      delete process.env.HEALTH_LAG_THRESHOLD;
-    }
-  });
-
-  it('returns default threshold of 100 when env var is not set', () => {
-    delete process.env.HEALTH_LAG_THRESHOLD;
-    
-    expect(getHealthLagThreshold()).toBe(100);
-  });
-
-  it('returns custom threshold when env var is set to valid positive integer', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '200';
-    
-    expect(getHealthLagThreshold()).toBe(200);
-  });
-
-  it('returns custom threshold for very large values', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '10000';
-    
-    expect(getHealthLagThreshold()).toBe(10000);
-  });
-
-  it('returns default threshold when env var is empty string', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '';
-    
-    expect(getHealthLagThreshold()).toBe(100);
-  });
-
-  it('returns default threshold when env var is not a valid number', () => {
-    process.env.HEALTH_LAG_THRESHOLD = 'not-a-number';
-    
-    expect(getHealthLagThreshold()).toBe(100);
-  });
-
-  it('returns default threshold when env var is zero', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '0';
-    
-    expect(getHealthLagThreshold()).toBe(100);
-  });
-
-  it('returns default threshold when env var is negative', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '-50';
-    
-    expect(getHealthLagThreshold()).toBe(100);
-  });
-
-  it('returns default threshold when env var is a decimal number', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '100.5';
-    
-    expect(getHealthLagThreshold()).toBe(100);
-  });
-
-  it('handles threshold of 1 correctly', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '1';
-    
-    expect(getHealthLagThreshold()).toBe(1);
-  });
-
-  it('ignores whitespace in env var value', () => {
-    process.env.HEALTH_LAG_THRESHOLD = '  250  ';
-    
-    expect(getHealthLagThreshold()).toBe(250);
-  });
-});
-
-describe('getIndexerStartTime', () => {
-  it('returns the INDEXER_START_TIME constant', () => {
-    const startTime = getIndexerStartTime();
-    
-    expect(startTime).toBe(INDEXER_START_TIME);
-    expect(startTime).toBeInstanceOf(Date);
-  });
-
-  it('returns the same Date object on multiple calls', () => {
-    const firstCall = getIndexerStartTime();
-    const secondCall = getIndexerStartTime();
-    
-    expect(firstCall).toBe(secondCall);
-  });
-
-  it('returns a valid Date object', () => {
-    const startTime = getIndexerStartTime();
-    
-    expect(startTime.getTime()).not.toBeNaN();
-    expect(startTime.toISOString()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
-  });
-});
-
-describe('calculateUptimeSeconds', () => {
-  it('calculates uptime correctly for a process started 5 minutes ago', () => {
-    const startTime = new Date(Date.now() - 5 * 60 * 1000);
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    // Allow for small timing variations (within 1 second)
-    expect(uptime).toBeGreaterThanOrEqual(299);
-    expect(uptime).toBeLessThanOrEqual(301);
-  });
-
-  it('returns 0 for a process that just started', () => {
-    const startTime = new Date();
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    expect(uptime).toBe(0);
-  });
-
-  it('calculates uptime correctly for a process started 1 hour ago', () => {
-    const startTime = new Date(Date.now() - 60 * 60 * 1000);
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    // Allow for small timing variations (within 1 second)
-    expect(uptime).toBeGreaterThanOrEqual(3599);
-    expect(uptime).toBeLessThanOrEqual(3601);
-  });
-
-  it('calculates uptime correctly for a process started 1 day ago', () => {
-    const startTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    // Allow for small timing variations (within 1 second)
-    expect(uptime).toBeGreaterThanOrEqual(86399);
-    expect(uptime).toBeLessThanOrEqual(86401);
-  });
-
-  it('returns an integer value (floors fractional seconds)', () => {
-    const startTime = new Date(Date.now() - 1500); // 1.5 seconds ago
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    expect(Number.isInteger(uptime)).toBe(true);
-    expect(uptime).toBe(1);
-  });
-
-  it('handles very small uptime values correctly', () => {
-    const startTime = new Date(Date.now() - 100); // 100ms ago
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    expect(uptime).toBe(0);
-  });
-
-  it('calculates uptime for a specific timestamp correctly', () => {
-    const startTime = new Date('2024-01-01T00:00:00.000Z');
-    const currentTime = new Date('2024-01-01T00:05:30.000Z');
-    
-    // Mock the Date constructor to return a specific time
-    const RealDate = Date;
-    global.Date = class extends RealDate {
-      constructor(...args: any[]) {
-        if (args.length === 0) {
-          super(currentTime.getTime());
-        } else {
-          super(...args);
-        }
-      }
-      static now() {
-        return currentTime.getTime();
-      }
-    } as any;
-    
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    expect(uptime).toBe(330); // 5 minutes 30 seconds = 330 seconds
-    
-    // Restore original Date
-    global.Date = RealDate;
-  });
-
-  it('returns non-negative values', () => {
-    const startTime = new Date(Date.now() - 10000);
-    const uptime = calculateUptimeSeconds(startTime);
-    
-    expect(uptime).toBeGreaterThanOrEqual(0);
-  });
-});
-
-describe('healthIndexerHandler - comprehensive unit tests', () => {
-  it('returns ok status when lag is below threshold', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date(Date.now() - 300000); // 5 minutes ago
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(200);
-    expect(response.body.status).toBe('ok');
-    expect(response.body.lag_ledgers).toBe(50);
-    expect(response.body.lag_seconds).toBe(250);
-  });
-
-  it('returns degraded status when lag exceeds threshold', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 800 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.lag_ledgers).toBe(200);
-    expect(response.body.lag_seconds).toBe(1000);
-  });
-
-  it('returns HTTP 200 for ok status', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 990 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(200);
-    expect(response.body.status).toBe('ok');
-  });
-
-  it('returns HTTP 503 for degraded status', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 700 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-  });
-
-  it('clamps negative lag to zero', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 900 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 1000 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(200);
-    expect(response.body.lag_ledgers).toBe(0);
-    expect(response.body.lag_seconds).toBe(0);
-  });
-
-  it('uses default threshold when HEALTH_LAG_THRESHOLD not set', async () => {
-    const originalEnv = process.env.HEALTH_LAG_THRESHOLD;
-    delete process.env.HEALTH_LAG_THRESHOLD;
-
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 899 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    // Don't pass lagThreshold, let it use default from environment
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-    }));
-
-    const response = await request(app).get('/health');
-
-    // Lag is 101, default threshold is 100, so should be degraded
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.lag_ledgers).toBe(101);
-
-    // Restore environment
-    if (originalEnv !== undefined) {
-      process.env.HEALTH_LAG_THRESHOLD = originalEnv;
-    }
-  });
-
-  it('uses custom threshold from environment variable', async () => {
-    const originalEnv = process.env.HEALTH_LAG_THRESHOLD;
-    process.env.HEALTH_LAG_THRESHOLD = '200';
-
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 850 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    // Don't pass lagThreshold, let it read from environment
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-    }));
-
-    const response = await request(app).get('/health');
-
-    // Lag is 150, custom threshold is 200, so should be ok
-    expect(response.status).toBe(200);
-    expect(response.body.status).toBe('ok');
-    expect(response.body.lag_ledgers).toBe(150);
-
-    // Restore environment
-    if (originalEnv !== undefined) {
-      process.env.HEALTH_LAG_THRESHOLD = originalEnv;
-    } else {
-      delete process.env.HEALTH_LAG_THRESHOLD;
-    }
-  });
-
-  it('handles RPC client failure gracefully', async () => {
-    const failingRpcClient = {
-      getLatestLedger: jest.fn().mockRejectedValue(new Error('Connection timeout')),
-    };
-
-    const mockDb = {
-      query: jest.fn().mockResolvedValue({ rows: [{ last_indexed_ledger: 950 }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: failingRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.error).toContain('RPC client unavailable');
-    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(0);
-    expect(response.body.timestamp).toBeDefined();
-  });
-
-  it('handles database query failure gracefully', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const failingDb = {
-      query: jest.fn().mockRejectedValue(new Error('Connection refused')),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: failingDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.error).toContain('Database query failed');
-  });
-
-  it('verifies uptime calculation accuracy', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    // Start time 10 minutes ago
-    const startTime = new Date(Date.now() - 10 * 60 * 1000);
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(200);
-    // Allow for small timing variations (within 2 seconds)
-    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(598);
-    expect(response.body.uptime_seconds).toBeLessThanOrEqual(602);
-  });
-
-  it('verifies event count queries return correct values', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '42' }] })  // proposals
-        .mockResolvedValueOnce({ rows: [{ count: '123' }] }) // votes
-        .mockResolvedValueOnce({ rows: [{ count: '17' }] }), // delegates
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(200);
-    expect(response.body.total_proposals_indexed).toBe(42);
-    expect(response.body.total_votes_indexed).toBe(123);
-    expect(response.body.total_delegates_indexed).toBe(17);
-  });
-
-  it('completes successfully when all queries finish within 5 seconds', async () => {
-    const fastRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date(Date.now() - 300000); // 5 minutes ago
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: fastRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(200);
-    expect(response.body.status).toBe('ok');
-    expect(response.body.current_ledger).toBe(1000);
-    expect(response.body.last_indexed_ledger).toBe(950);
-    expect(response.body.lag_ledgers).toBe(50);
-    expect(response.body.lag_seconds).toBe(250);
-    expect(response.body.total_proposals_indexed).toBe(10);
-    expect(response.body.total_votes_indexed).toBe(20);
-    expect(response.body.total_delegates_indexed).toBe(5);
-    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(299);
-    expect(response.body.timestamp).toBeDefined();
-    expect(response.body.error).toBeUndefined();
-  });
-
-  it('handles proposals count query failure', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    let callCount = 0;
-    const mockDb = {
-      query: jest.fn().mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) {
-          // First call: indexer_state query succeeds
-          return Promise.resolve({ rows: [{ last_indexed_ledger: 950 }] });
-        } else if (callCount === 2) {
-          // Second call: proposals query fails
-          return Promise.reject(new Error('Proposals table error'));
-        }
-        // Shouldn't reach here
-        return Promise.resolve({ rows: [{ count: '0' }] });
-      }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.error).toContain('Proposals count query failed');
-  });
-
-  it('handles votes count query failure', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    let callCount = 0;
-    const mockDb = {
-      query: jest.fn().mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) {
-          // First call: indexer_state query succeeds
-          return Promise.resolve({ rows: [{ last_indexed_ledger: 950 }] });
-        } else if (callCount === 2) {
-          // Second call: proposals query succeeds
-          return Promise.resolve({ rows: [{ count: '10' }] });
-        } else if (callCount === 3) {
-          // Third call: votes query fails
-          return Promise.reject(new Error('Votes table error'));
-        }
-        // Shouldn't reach here
-        return Promise.resolve({ rows: [{ count: '0' }] });
-      }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.error).toContain('Votes count query failed');
-  });
-
-  it('handles delegates count query failure', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockRejectedValueOnce(new Error('Delegates table error')),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.error).toContain('Delegates count query failed');
-  });
-
-  it('returns all required response fields with correct types', async () => {
-    const mockRpcClient = {
-      getLatestLedger: jest.fn().mockResolvedValue({ sequence: 1000 }),
-    };
-
-    const mockDb = {
-      query: jest.fn()
-        .mockResolvedValueOnce({ rows: [{ last_indexed_ledger: 950 }] })
-        .mockResolvedValueOnce({ rows: [{ count: '10' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '20' }] })
-        .mockResolvedValueOnce({ rows: [{ count: '5' }] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: mockRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    // Verify all required fields exist
-    expect(response.body).toHaveProperty('status');
-    expect(response.body).toHaveProperty('last_indexed_ledger');
-    expect(response.body).toHaveProperty('current_ledger');
-    expect(response.body).toHaveProperty('lag_ledgers');
-    expect(response.body).toHaveProperty('lag_seconds');
-    expect(response.body).toHaveProperty('total_proposals_indexed');
-    expect(response.body).toHaveProperty('total_votes_indexed');
-    expect(response.body).toHaveProperty('total_delegates_indexed');
-    expect(response.body).toHaveProperty('uptime_seconds');
-    expect(response.body).toHaveProperty('timestamp');
-
-    // Verify types
-    expect(['ok', 'degraded']).toContain(response.body.status);
-    expect(typeof response.body.last_indexed_ledger).toBe('number');
-    expect(typeof response.body.current_ledger).toBe('number');
-    expect(typeof response.body.lag_ledgers).toBe('number');
-    expect(typeof response.body.lag_seconds).toBe('number');
-    expect(typeof response.body.total_proposals_indexed).toBe('number');
-    expect(typeof response.body.total_votes_indexed).toBe('number');
-    expect(typeof response.body.total_delegates_indexed).toBe('number');
-    expect(typeof response.body.uptime_seconds).toBe('number');
-    expect(typeof response.body.timestamp).toBe('string');
-
-    // Verify non-negative values
-    expect(response.body.last_indexed_ledger).toBeGreaterThanOrEqual(0);
-    expect(response.body.current_ledger).toBeGreaterThanOrEqual(0);
-    expect(response.body.lag_ledgers).toBeGreaterThanOrEqual(0);
-    expect(response.body.lag_seconds).toBeGreaterThanOrEqual(0);
-    expect(response.body.total_proposals_indexed).toBeGreaterThanOrEqual(0);
-    expect(response.body.total_votes_indexed).toBeGreaterThanOrEqual(0);
-    expect(response.body.total_delegates_indexed).toBeGreaterThanOrEqual(0);
-    expect(response.body.uptime_seconds).toBeGreaterThanOrEqual(0);
-
-    // Verify ISO 8601 timestamp format
-    expect(response.body.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
-    expect(() => new Date(response.body.timestamp).toISOString()).not.toThrow();
-  });
-
-  it('includes error field only when status is degraded', async () => {
-    const failingRpcClient = {
-      getLatestLedger: jest.fn().mockRejectedValue(new Error('Network error')),
-    };
-
-    const mockDb = {
-      query: jest.fn().mockResolvedValue({ rows: [] }),
-    };
-
-    const startTime = new Date();
-
-    const app = express();
-    const { healthIndexerHandler } = await import('./health');
-    
-    app.get('/health', healthIndexerHandler({
-      db: mockDb,
-      rpcClient: failingRpcClient,
-      startTime,
-      lagThreshold: 100,
-    }));
-
-    const response = await request(app).get('/health');
-
-    expect(response.status).toBe(503);
-    expect(response.body.status).toBe('degraded');
-    expect(response.body.error).toBeDefined();
-    expect(typeof response.body.error).toBe('string');
-    expect(response.body.error.length).toBeGreaterThan(0);
-  });
-});
-
-describe('classifyStellarRPCFailure', () => {
-  it('classifies timeout failures', () => {
-    const error = new Error('network timeout');
-    error.name = 'AbortError';
-
-    expect(classifyStellarRPCFailure(error)).toBe(StellarRPCFailureClass.TIMEOUT);
-  });
-
-  it('classifies rate limit failures', () => {
+  it("classifies rate limit failures", () => {
     expect(classifyStellarRPCFailure({ status: 429 })).toBe(
       StellarRPCFailureClass.RATE_LIMIT,
     );
   });
 
-  it('classifies auth failures', () => {
+  it("classifies auth failures", () => {
     expect(classifyStellarRPCFailure({ status: 401 })).toBe(
       StellarRPCFailureClass.UNAUTHORIZED,
     );
@@ -951,46 +52,51 @@ describe('classifyStellarRPCFailure', () => {
     );
   });
 
-  it('classifies upstream 5xx failures', () => {
+  it("classifies upstream 5xx failures", () => {
     expect(classifyStellarRPCFailure({ status: 503 })).toBe(
       StellarRPCFailureClass.UPSTREAM_ERROR,
     );
   });
 
-  it('classifies malformed responses', () => {
-    expect(classifyStellarRPCFailure(new SyntaxError('bad json'))).toBe(
+  it("classifies malformed responses", () => {
+    expect(classifyStellarRPCFailure(new SyntaxError("bad json"))).toBe(
       StellarRPCFailureClass.MALFORMED_RESPONSE,
     );
   });
 
-  it('falls back to unknown for uncategorized errors', () => {
-    expect(classifyStellarRPCFailure(new Error('something odd'))).toBe(
+  it("falls back to unknown for uncategorized errors", () => {
+    expect(classifyStellarRPCFailure(new Error("something odd"))).toBe(
       StellarRPCFailureClass.UNKNOWN,
     );
   });
 });
 
-describe('mapHealthDependencyFailure', () => {
-  it('sanitizes database dependency errors', () => {
-    const mapped = mapHealthDependencyFailure('database', new Error('password auth failed'));
+describe("mapHealthDependencyFailure", () => {
+  it("sanitizes database dependency errors", () => {
+    const mapped = mapHealthDependencyFailure(
+      "database",
+      new Error("password auth failed"),
+    );
 
     expect(mapped.toResponse()).toEqual({
       code: ErrorCode.SERVICE_UNAVAILABLE,
-      message: 'Dependency unavailable',
+      message: "Dependency unavailable",
       details: {
-        dependency: 'database',
+        dependency: "database",
       },
     });
   });
 
-  it('preserves stable Stellar metadata without leaking raw upstream details', () => {
-    const mapped = mapHealthDependencyFailure('stellar-horizon', { status: 503 });
+  it("preserves stable Stellar metadata without leaking raw upstream details", () => {
+    const mapped = mapHealthDependencyFailure("stellar-horizon", {
+      status: 503,
+    });
 
     expect(mapped.toResponse()).toEqual({
       code: ErrorCode.SERVICE_UNAVAILABLE,
-      message: 'Dependency unavailable',
+      message: "Dependency unavailable",
       details: {
-        dependency: 'stellar-horizon',
+        dependency: "stellar-horizon",
         failureClass: StellarRPCFailureClass.UPSTREAM_ERROR,
         upstreamStatus: 503,
       },
@@ -998,7 +104,7 @@ describe('mapHealthDependencyFailure', () => {
   });
 });
 
-describe('healthReadyHandler', () => {
+describe("healthReadyHandler", () => {
   const originalFetch = global.fetch;
 
   afterEach(() => {
@@ -1006,53 +112,123 @@ describe('healthReadyHandler', () => {
     jest.restoreAllMocks();
   });
 
-  it('returns ok when both database and horizon are healthy', async () => {
-    const db = {
-      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
-    };
-    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+  it("returns ok when both database and horizon are healthy", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 25,
+      pool: {
+        totalCount: 2,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
 
     const app = express();
-    app.get('/ready', healthReadyHandler(db));
+    app.get("/ready", healthReadyHandler(mockDbHealth));
 
-    const response = await request(app).get('/ready');
+    const response = await request(app).get("/ready");
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({
-      status: 'ok',
-      db: 'up',
-      stellar: 'up',
-    });
+    expect(response.body.ready).toBe(true);
+    expect(response.body.service).toBe("revora-backend");
+    expect(response.body.checks).toContain("database");
+    expect(response.body.checks).toContain("stellar-horizon");
   });
 
-  it('surfaces sanitized database failures', async () => {
-    const db = {
-      query: jest.fn().mockRejectedValue(new Error('connection string leaked')),
-    };
-    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+  it("surfaces sanitized database failures", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: false,
+      latencyMs: 100,
+      error: "connection failed",
+      pool: {
+        totalCount: 0,
+        idleCount: 0,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
 
     const app = express();
-    app.get('/ready', healthReadyHandler(db));
-    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      const mapped = err as { statusCode: number; toResponse: () => unknown };
-      res.status(mapped.statusCode).json(mapped.toResponse());
-    });
+    app.get("/ready", healthReadyHandler(mockDbHealth));
+    app.use(
+      (
+        err: unknown,
+        _req: express.Request,
+        res: express.Response,
+        _next: express.NextFunction,
+      ) => {
+        const mapped = err as { statusCode: number; toResponse: () => unknown };
+        res.status(mapped.statusCode).json(mapped.toResponse());
+      },
+    );
 
-    const response = await request(app).get('/ready');
+    const response = await request(app).get("/ready");
 
     expect(response.status).toBe(503);
     expect(response.body).toEqual({
       code: ErrorCode.SERVICE_UNAVAILABLE,
-      message: 'Dependency unavailable',
+      message: "Dependency unavailable",
       details: {
-        dependency: 'database',
+        dependency: "database",
       },
     });
   });
 
-  it('maps Stellar upstream failures deterministically', async () => {
+  it("maps Stellar upstream failures deterministically", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 20,
+      pool: {
+        totalCount: 2,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: false, status: 429 }) as typeof fetch;
+
+    const app = express();
+    app.use("/health", createHealthRouter(mockDbHealth));
+    app.use(
+      (
+        err: unknown,
+        _req: express.Request,
+        res: express.Response,
+        _next: express.NextFunction,
+      ) => {
+        const mapped = err as { statusCode: number; toResponse: () => unknown };
+        res.status(mapped.statusCode).json(mapped.toResponse());
+      },
+    );
+
+    const response = await request(app).get("/health/ready");
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      code: ErrorCode.SERVICE_UNAVAILABLE,
+      message: "Dependency unavailable",
+      details: {
+        dependency: "stellar-horizon",
+        failureClass: StellarRPCFailureClass.RATE_LIMIT,
+        upstreamStatus: 429,
+      },
+    });
+  });
+
+  it('catches and surfaces fetch exceptions deterministically', async () => {
     const db = { query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }) };
-    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 429 }) as typeof fetch;
+    const networkError = new Error('network timeout');
+    networkError.name = 'AbortError';
+    global.fetch = jest.fn().mockRejectedValue(networkError) as typeof fetch;
 
     const app = express();
     app.use('/health', createHealthRouter(db));
@@ -1069,94 +245,95 @@ describe('healthReadyHandler', () => {
       message: 'Dependency unavailable',
       details: {
         dependency: 'stellar-horizon',
-        failureClass: StellarRPCFailureClass.RATE_LIMIT,
-        upstreamStatus: 429,
+        failureClass: StellarRPCFailureClass.TIMEOUT,
       },
     });
   });
 });
 
-describe('offering validation matrix', () => {
-  const path = '/api/v1/offerings/validation-matrix';
+describe("offering validation matrix", () => {
+  const path = "/api/v1/offerings/validation-matrix";
 
   function buildApp() {
     return createApp({
-      healthStatus: jest.fn().mockResolvedValue({ healthy: true, latencyMs: 1 }),
+      healthStatus: jest
+        .fn()
+        .mockResolvedValue({ healthy: true, latencyMs: 1 }),
       healthQuery: jest.fn(),
     });
   }
 
-  function authHeaders(role: string, id = 'actor-1') {
+  function authHeaders(role: string, id = "actor-1") {
     return {
-      'x-user-id': id,
-      'x-user-role': role,
+      "x-user-id": id,
+      "x-user-role": role,
     };
   }
 
-  it('rejects unauthenticated callers at the auth boundary', async () => {
+  it("rejects unauthenticated callers at the auth boundary", async () => {
     const response = await request(buildApp())
       .post(path)
       .send({
-        action: 'create',
-        offering: { targetAmount: '1000.00', minimumInvestment: '50.00' },
+        action: "create",
+        offering: { targetAmount: "1000.00", minimumInvestment: "50.00" },
       });
 
     expect(response.status).toBe(401);
     expect(response.body).toMatchObject({
       code: ErrorCode.UNAUTHORIZED,
-      message: 'Offering validation requires x-user-id and x-user-role headers',
+      message: "Offering validation requires x-user-id and x-user-role headers",
     });
   });
 
-  it('rejects invalid actions with an explicit schema error', async () => {
+  it("rejects invalid actions with an explicit schema error", async () => {
     const response = await request(buildApp())
       .post(path)
-      .set(authHeaders('startup'))
+      .set(authHeaders("startup"))
       .send({
-        action: 'destroy',
+        action: "destroy",
         offering: {},
       });
 
     expect(response.status).toBe(400);
     expect(response.body).toMatchObject({
       code: ErrorCode.BAD_REQUEST,
-      message: 'Invalid offering validation action',
+      message: "Invalid offering validation action",
     });
   });
 
-  it('allows a startup to publish its own valid draft offering', async () => {
+  it("allows a startup to publish its own valid draft offering", async () => {
     const response = await request(buildApp())
       .post(path)
-      .set(authHeaders('startup', 'issuer-1'))
+      .set(authHeaders("startup", "issuer-1"))
       .send({
-        action: 'publish',
+        action: "publish",
         offering: {
-          id: 'off-1',
-          issuerId: 'issuer-1',
-          status: 'draft',
-          targetAmount: '1000.00',
-          minimumInvestment: '50.00',
-          subscriptionStartsAt: '2030-01-01T00:00:00.000Z',
-          subscriptionEndsAt: '2030-01-15T00:00:00.000Z',
+          id: "off-1",
+          issuerId: "issuer-1",
+          status: "draft",
+          targetAmount: "1000.00",
+          minimumInvestment: "50.00",
+          subscriptionStartsAt: "2030-01-01T00:00:00.000Z",
+          subscriptionEndsAt: "2030-01-15T00:00:00.000Z",
         },
       });
 
     expect(response.status).toBe(200);
     expect(response.body.allowed).toBe(true);
-    expect(response.body.decision).toBe('allow');
+    expect(response.body.decision).toBe("allow");
     expect(response.body.violations).toEqual([]);
   });
 
-  it('denies a startup from managing another issuers offering', async () => {
+  it("denies a startup from managing another issuers offering", async () => {
     const response = await request(buildApp())
       .post(path)
-      .set(authHeaders('startup', 'issuer-1'))
+      .set(authHeaders("startup", "issuer-1"))
       .send({
-        action: 'pause',
+        action: "pause",
         offering: {
-          id: 'off-2',
-          issuerId: 'issuer-2',
-          status: 'open',
+          id: "off-2",
+          issuerId: "issuer-2",
+          status: "open",
         },
       });
 
@@ -1165,27 +342,27 @@ describe('offering validation matrix', () => {
     expect(response.body.violations).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          code: 'OWNERSHIP_CONFIRMED',
+          code: "OWNERSHIP_CONFIRMED",
         }),
       ]),
     );
   });
 
-  it('denies investment attempts outside the allowed subscription window', async () => {
+  it("denies investment attempts outside the allowed subscription window", async () => {
     const response = await request(buildApp())
       .post(path)
-      .set(authHeaders('investor', 'investor-1'))
+      .set(authHeaders("investor", "investor-1"))
       .send({
-        action: 'invest',
+        action: "invest",
         offering: {
-          id: 'off-3',
-          issuerId: 'issuer-3',
-          status: 'open',
-          targetAmount: '1000.00',
-          minimumInvestment: '100.00',
-          investmentAmount: '125.00',
-          subscriptionStartsAt: '2020-01-01T00:00:00.000Z',
-          subscriptionEndsAt: '2020-01-15T00:00:00.000Z',
+          id: "off-3",
+          issuerId: "issuer-3",
+          status: "open",
+          targetAmount: "1000.00",
+          minimumInvestment: "100.00",
+          investmentAmount: "125.00",
+          subscriptionStartsAt: "2020-01-01T00:00:00.000Z",
+          subscriptionEndsAt: "2020-01-15T00:00:00.000Z",
         },
       });
 
@@ -1194,27 +371,27 @@ describe('offering validation matrix', () => {
     expect(response.body.violations).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          code: 'INVESTMENT_WINDOW_ACTIVE',
+          code: "INVESTMENT_WINDOW_ACTIVE",
         }),
       ]),
     );
   });
 
-  it('blocks issuer self-investment by default', async () => {
+  it("blocks issuer self-investment by default", async () => {
     const response = await request(buildApp())
       .post(path)
-      .set(authHeaders('investor', 'issuer-4'))
+      .set(authHeaders("investor", "issuer-4"))
       .send({
-        action: 'invest',
+        action: "invest",
         offering: {
-          id: 'off-4',
-          issuerId: 'issuer-4',
-          status: 'open',
-          targetAmount: '500.00',
-          minimumInvestment: '50.00',
-          investmentAmount: '50.00',
-          subscriptionStartsAt: '2030-01-01T00:00:00.000Z',
-          subscriptionEndsAt: '2030-01-10T00:00:00.000Z',
+          id: "off-4",
+          issuerId: "issuer-4",
+          status: "open",
+          targetAmount: "500.00",
+          minimumInvestment: "50.00",
+          investmentAmount: "50.00",
+          subscriptionStartsAt: "2030-01-01T00:00:00.000Z",
+          subscriptionEndsAt: "2030-01-10T00:00:00.000Z",
         },
       });
 
@@ -1223,22 +400,22 @@ describe('offering validation matrix', () => {
     expect(response.body.violations).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          code: 'INVESTOR_NOT_ISSUER',
+          code: "INVESTOR_NOT_ISSUER",
         }),
       ]),
     );
   });
 
-  it('allows privileged compliance actors to review private offerings without ownership', async () => {
+  it("allows privileged compliance actors to review private offerings without ownership", async () => {
     const response = await request(buildApp())
       .post(path)
-      .set(authHeaders('compliance', 'compliance-1'))
+      .set(authHeaders("compliance", "compliance-1"))
       .send({
-        action: 'viewPrivate',
+        action: "viewPrivate",
         offering: {
-          id: 'off-5',
-          issuerId: 'issuer-99',
-          status: 'paused',
+          id: "off-5",
+          issuerId: "issuer-99",
+          status: "paused",
         },
       });
 
@@ -1247,81 +424,84 @@ describe('offering validation matrix', () => {
     expect(response.body.violations).toEqual([]);
   });
 
-  it('returns degraded root health when the dependency checker reports failure', async () => {
+  it("returns degraded root health when the dependency checker reports failure", async () => {
     const app = createApp({
       healthStatus: jest.fn().mockResolvedValue({
         healthy: false,
         latencyMs: 4,
-        error: 'sanitized-db-error',
+        error: "sanitized-db-error",
       }),
       healthQuery: jest.fn(),
     });
 
-    const response = await request(app).get('/health');
+    const response = await request(app).get("/health");
 
     expect(response.status).toBe(503);
     expect(response.body).toEqual({
-      status: 'degraded',
-      service: 'revora-backend',
+      status: "degraded",
+      service: "revora-backend",
       db: {
         healthy: false,
         latencyMs: 4,
-        error: 'sanitized-db-error',
+        error: "sanitized-db-error",
       },
     });
   });
 
-  it('serves the overview document on the versioned API prefix', async () => {
-    const response = await request(buildApp()).get('/api/v1/overview');
+  it("serves the overview document on the versioned API prefix", async () => {
+    const response = await request(buildApp()).get("/api/v1/overview");
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({
-      name: 'Stellar RevenueShare (Revora) Backend',
-      version: '0.1.0',
+      name: "Stellar RevenueShare (Revora) Backend",
+      version: "0.1.0",
     });
   });
 
-  it('rate limits repeated startup registration attempts on the versioned route', async () => {
+  it("rate limits repeated startup registration attempts on the versioned route", async () => {
     const app = buildApp();
 
     for (let i = 0; i < 5; i += 1) {
       const response = await request(app)
-        .post('/api/v1/startup/register')
-        .send({ email: `founder-${i}@example.com`, password: 'VeryStrongPass!9' });
+        .post("/api/v1/startup/register")
+        .send({
+          email: `founder-${i}@example.com`,
+          password: "VeryStrongPass!9",
+        });
 
       expect(response.status).toBe(201);
-      expect(response.headers['x-ratelimit-limit']).toBe('5');
+      expect(response.headers["x-ratelimit-limit"]).toBe("5");
     }
 
     const blocked = await request(app)
-      .post('/api/v1/startup/register')
-      .send({ email: 'founder-6@example.com', password: 'VeryStrongPass!9' });
+      .post("/api/v1/startup/register")
+      .send({ email: "founder-6@example.com", password: "VeryStrongPass!9" });
 
     expect(blocked.status).toBe(429);
     expect(blocked.body).toEqual({
-      error: 'TooManyRequests',
-      message: 'Too many registration attempts',
+      error: "TooManyRequests",
+      message: "Too many registration attempts",
     });
-    expect(blocked.headers['x-ratelimit-remaining']).toBe('0');
-    expect(blocked.headers['retry-after']).toBeDefined();
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(blocked.headers["retry-after"]).toBeDefined();
   });
 
-  it('rejects startup registration payloads that omit required credentials', async () => {
+  it("rejects startup registration payloads that omit required credentials", async () => {
     const response = await request(buildApp())
-      .post('/api/v1/startup/register')
-      .send({ email: 'missing-password@example.com' });
+      .post("/api/v1/startup/register")
+      .send({ email: "missing-password@example.com" });
 
     expect(response.status).toBe(400);
     expect(response.body).toEqual({
-      error: 'Email and password are required',
+      error: "Email and password are required",
     });
   });
 });
 
-describe('WebhookQueue', () => {
+describe("WebhookQueue", () => {
   beforeEach(() => {
     jest.useFakeTimers();
-    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(console, "error").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
@@ -1329,19 +509,24 @@ describe('WebhookQueue', () => {
     jest.restoreAllMocks();
   });
 
-  it('classifies safe and unsafe webhook targets correctly', () => {
-    const isSafeUrl = (WebhookQueue as unknown as { isSafeUrl: (url: string) => boolean }).isSafeUrl;
+  it("classifies safe and unsafe webhook targets correctly", () => {
+    const isSafeUrl = (
+      WebhookQueue as unknown as { isSafeUrl: (url: string) => boolean }
+    ).isSafeUrl;
 
-    expect(isSafeUrl('https://example.com/hooks')).toBe(true);
-    expect(isSafeUrl('http://127.0.0.1')).toBe(false);
-    expect(isSafeUrl('http://localhost')).toBe(false);
-    expect(isSafeUrl('not-a-valid-url')).toBe(false);
+    expect(isSafeUrl("https://example.com/hooks")).toBe(true);
+    expect(isSafeUrl("http://127.0.0.1")).toBe(false);
+    expect(isSafeUrl("http://localhost")).toBe(false);
+    expect(isSafeUrl("not-a-valid-url")).toBe(false);
   });
 
-  it('uses exponential backoff and stops after the configured retry ceiling', async () => {
-    const deliveryPromise = WebhookQueue.processDelivery('https://example.com/hooks', {
-      event: 'test',
-    });
+  it("uses exponential backoff and stops after the configured retry ceiling", async () => {
+    const deliveryPromise = WebhookQueue.processDelivery(
+      "https://example.com/hooks",
+      {
+        event: "test",
+      },
+    );
 
     await jest.advanceTimersByTimeAsync(31_000);
 
@@ -1350,10 +535,121 @@ describe('WebhookQueue', () => {
     expect(WebhookQueue.getBackoffDelay(5)).toBe(-1);
   });
 
-  it('fails fast for unsafe SSRF-style destinations', async () => {
+  it("fails fast for unsafe SSRF-style destinations", async () => {
     await expect(
-      WebhookQueue.processDelivery('http://192.168.1.10/internal', { event: 'test' }),
+      WebhookQueue.processDelivery("http://192.168.1.10/internal", {
+        event: "test",
+      }),
     ).resolves.toBe(false);
+  });
+});
+
+describe('health metrics collection', () => {
+  let metrics: MetricsCollector;
+
+  beforeEach(() => {
+    metrics = new MetricsCollector({ enabled: true });
+  });
+
+  afterEach(() => {
+    metrics.reset();
+  });
+
+  it('should record successful health check metrics', async () => {
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db, metrics));
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const mapped = err as { statusCode: number; toResponse: () => unknown };
+      res.status(mapped.statusCode).json(mapped.toResponse());
+    });
+
+    await request(app).get('/ready');
+
+    const snapshot = await metrics.getSnapshot();
+    expect(snapshot.custom.length).toBeGreaterThan(0);
+    
+    // Check for health check metrics
+    const dbSuccess = snapshot.custom.find(m => 
+      m.name === 'health_checks_total' && 
+      m.labels?.check === 'database' && 
+      m.labels?.status === 'success'
+    );
+    expect(dbSuccess?.value).toBe(1);
+
+    const stellarSuccess = snapshot.custom.find(m => 
+      m.name === 'health_checks_total' && 
+      m.labels?.check === 'stellar-horizon' && 
+      m.labels?.status === 'success'
+    );
+    expect(stellarSuccess?.value).toBe(1);
+  });
+
+  it('should record failed health check metrics', async () => {
+    const db = {
+      query: jest.fn().mockRejectedValue(new Error('connection failed')),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db, metrics));
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const mapped = err as { statusCode: number; toResponse: () => unknown };
+      res.status(mapped.statusCode).json(mapped.toResponse());
+    });
+
+    await request(app).get('/ready');
+
+    const snapshot = await metrics.getSnapshot();
+    const dbFailure = snapshot.custom.find(m => 
+      m.name === 'health_checks_total' && 
+      m.labels?.check === 'database' && 
+      m.labels?.status === 'failure'
+    );
+    expect(dbFailure?.value).toBe(1);
+  });
+
+  it('should record health check duration', async () => {
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db, metrics));
+
+    await request(app).get('/ready');
+
+    const snapshot = await metrics.getSnapshot();
+    const durationMetric = snapshot.custom.find(m => 
+      m.name === 'health_check_duration_ms' && 
+      m.labels?.endpoint === 'ready'
+    );
+    expect(durationMetric).toBeDefined();
+    expect(durationMetric?.value).toBeGreaterThan(0);
+  });
+
+  it('should work without metrics collector', async () => {
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db)); // No metrics
+
+    const response = await request(app).get('/ready');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      status: 'ok',
+      db: 'up',
+      stellar: 'up',
+    });
   });
 });
 
@@ -1367,7 +663,7 @@ describe('__test helpers', () => {
     ).toBe('{"a":{"c":3,"d":4},"b":1}');
   });
 
-  it('stableSerialize preserves arrays while sorting nested object keys', () => {
+  it("stableSerialize preserves arrays while sorting nested object keys", () => {
     expect(
       __test.stableSerialize([
         { z: 2, a: 1 },
@@ -1376,120 +672,465 @@ describe('__test helpers', () => {
     ).toBe('[{"a":1,"z":2},{"a":1,"b":2}]');
   });
 
-  it('parseMoneyString accepts bounded decimal strings and rejects invalid input', () => {
-    expect(__test.parseMoneyString('999.99')).toBe(999.99);
-    expect(__test.parseMoneyString('1e6')).toBeNull();
+  it("parseMoneyString accepts bounded decimal strings and rejects invalid input", () => {
+    expect(__test.parseMoneyString("999.99")).toBe(999.99);
+    expect(__test.parseMoneyString("1e6")).toBeNull();
     expect(__test.parseMoneyString(10)).toBeNull();
   });
 
-  it('parseIsoDate accepts valid ISO strings and rejects invalid dates', () => {
-    expect(__test.parseIsoDate('2030-01-01T00:00:00.000Z')?.toISOString()).toBe(
-      '2030-01-01T00:00:00.000Z',
+  it("parseIsoDate accepts valid ISO strings and rejects invalid dates", () => {
+    expect(__test.parseIsoDate("2030-01-01T00:00:00.000Z")?.toISOString()).toBe(
+      "2030-01-01T00:00:00.000Z",
     );
-    expect(__test.parseIsoDate('definitely-not-a-date')).toBeNull();
+    expect(__test.parseIsoDate("definitely-not-a-date")).toBeNull();
   });
 
-  it('parseOfferingValidationPayload preserves trimmed deterministic values', () => {
+  it("parseOfferingValidationPayload preserves trimmed deterministic values", () => {
     expect(
       __test.parseOfferingValidationPayload({
-        action: 'create',
+        action: "create",
         offering: {
-          issuerId: ' issuer-1 ',
-          targetAmount: '100.00',
-          minimumInvestment: '10.00',
+          issuerId: " issuer-1 ",
+          targetAmount: "100.00",
+          minimumInvestment: "10.00",
         },
       }),
     ).toEqual({
-      action: 'create',
+      action: "create",
       offering: {
-        issuerId: 'issuer-1',
-        targetAmount: '100.00',
-        minimumInvestment: '10.00',
+        issuerId: "issuer-1",
+        targetAmount: "100.00",
+        minimumInvestment: "10.00",
       },
     });
   });
 
-  it('parseOfferingValidationPayload rejects malformed bodies and invalid field values', () => {
+  it("parseOfferingValidationPayload rejects malformed bodies and invalid field values", () => {
     expect(() => __test.parseOfferingValidationPayload(null)).toThrow(
-      'Validation payload must be a JSON object',
+      "Validation payload must be a JSON object",
     );
     expect(() =>
       __test.parseOfferingValidationPayload({
-        action: 'create',
+        action: "create",
       }),
-    ).toThrow('Offering validation payload must include an offering object');
+    ).toThrow("Offering validation payload must include an offering object");
     expect(() =>
       __test.parseOfferingValidationPayload({
-        action: 'create',
-        offering: { id: '   ' },
+        action: "create",
+        offering: { id: "   " },
       }),
-    ).toThrow('offering.id must be a non-empty string');
+    ).toThrow("offering.id must be a non-empty string");
     expect(() =>
       __test.parseOfferingValidationPayload({
-        action: 'create',
-        offering: { issuerId: '' },
+        action: "create",
+        offering: { issuerId: "" },
       }),
-    ).toThrow('offering.issuerId must be a non-empty string');
+    ).toThrow("offering.issuerId must be a non-empty string");
     expect(() =>
       __test.parseOfferingValidationPayload({
-        action: 'create',
-        offering: { status: 'live' },
+        action: "create",
+        offering: { status: "live" },
       }),
-    ).toThrow('offering.status must be a supported offering status');
+    ).toThrow("offering.status must be a supported offering status");
     expect(() =>
       __test.parseOfferingValidationPayload({
-        action: 'create',
-        offering: { targetAmount: '' },
+        action: "create",
+        offering: { targetAmount: "" },
       }),
-    ).toThrow('offering.targetAmount must be a non-empty string');
+    ).toThrow("offering.targetAmount must be a non-empty string");
   });
 
-  it('evaluateOfferingValidationMatrix covers close, cancel, and missing investment window rules', () => {
-    const actor = { id: 'issuer-1', role: 'startup' as const };
+  it("evaluateOfferingValidationMatrix covers close, cancel, and missing investment window rules", () => {
+    const actor = { id: "issuer-1", role: "startup" as const };
 
     const closeResult = __test.evaluateOfferingValidationMatrix(actor, {
-      action: 'close',
+      action: "close",
       offering: {
-        issuerId: 'issuer-1',
-        status: 'paused',
+        issuerId: "issuer-1",
+        status: "paused",
       },
     });
     expect(closeResult.allowed).toBe(true);
 
     const cancelResult = __test.evaluateOfferingValidationMatrix(actor, {
-      action: 'cancel',
+      action: "cancel",
       offering: {
-        issuerId: 'issuer-1',
-        status: 'closed',
+        issuerId: "issuer-1",
+        status: "closed",
       },
     });
     expect(cancelResult.allowed).toBe(false);
     expect(cancelResult.violations).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ code: 'STATUS_ELIGIBLE_FOR_CANCEL' }),
+        expect.objectContaining({ code: "STATUS_ELIGIBLE_FOR_CANCEL" }),
       ]),
     );
 
     const investResult = __test.evaluateOfferingValidationMatrix(
-      { id: 'investor-1', role: 'investor' },
+      { id: "investor-1", role: "investor" },
       {
-        action: 'invest',
+        action: "invest",
         offering: {
-          issuerId: 'issuer-2',
-          status: 'open',
-          targetAmount: '1000.00',
-          minimumInvestment: '50.00',
-          investmentAmount: '50.00',
+          issuerId: "issuer-2",
+          status: "open",
+          targetAmount: "1000.00",
+          minimumInvestment: "50.00",
+          investmentAmount: "50.00",
         },
       },
-      new Date('2030-01-05T00:00:00.000Z'),
+      new Date("2030-01-05T00:00:00.000Z"),
     );
 
     expect(investResult.allowed).toBe(false);
     expect(investResult.violations).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ code: 'INVESTMENT_WINDOW_ACTIVE' }),
+        expect.objectContaining({ code: "INVESTMENT_WINDOW_ACTIVE" }),
       ]),
     );
+  });
+});
+
+describe("healthRootHandler - dependency graph", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("returns comprehensive health with dependency graph when all services are healthy", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 25,
+      pool: {
+        totalCount: 5,
+        idleCount: 3,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe("healthy");
+    expect(response.body.service).toBe("revora-backend");
+    expect(response.body.checks).toHaveLength(2);
+    expect(response.body.checks[0].name).toBe("database");
+    expect(response.body.checks[0].status).toBe("up");
+    expect(response.body.checks[0].healthy).toBe(true);
+    expect(response.body.checks[0].details).toMatchObject({
+      totalCount: 5,
+      idleCount: 3,
+      utilizationPercent: 50,
+    });
+    expect(response.body.checks[1].name).toBe("stellar-horizon");
+    expect(response.body.checks[1].status).toBe("up");
+    expect(response.body.checks[1].healthy).toBe(true);
+    expect(response.body.uptime).toBeGreaterThanOrEqual(0);
+    expect(response.body.timestamp).toBeDefined();
+    expect(response.body.version).toBeDefined();
+  });
+
+  it("returns degraded status when pool utilization is high", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 50,
+      pool: {
+        totalCount: 9,
+        idleCount: 1,
+        waitingCount: 2,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe("degraded");
+    expect(response.body.checks[0].status).toBe("degraded");
+    expect(response.body.checks[0].details.utilizationPercent).toBe(90);
+  });
+
+  it("returns unhealthy status and 503 when database is down", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: false,
+      latencyMs: 100,
+      error: "connection refused",
+      pool: {
+        totalCount: 0,
+        idleCount: 0,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe("unhealthy");
+    expect(response.body.checks[0].name).toBe("database");
+    expect(response.body.checks[0].status).toBe("down");
+    expect(response.body.checks[0].healthy).toBe(false);
+    expect(response.body.checks[0].error).toBe("sanitized-db-error");
+  });
+
+  it("includes requestId in response when provided in headers", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 10,
+      pool: {
+        totalCount: 2,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app)
+      .get("/health")
+      .set("x-request-id", "test-req-123");
+
+    expect(response.body.requestId).toBe("test-req-123");
+  });
+});
+
+describe("healthLiveHandler - liveness probe", () => {
+  it("returns alive status for liveness probe", async () => {
+    const app = express();
+    app.get("/live", healthLiveHandler());
+
+    const response = await request(app).get("/live");
+
+    expect(response.status).toBe(200);
+    expect(response.body.alive).toBe(true);
+    expect(response.body.service).toBe("revora-backend");
+    expect(response.body.timestamp).toBeDefined();
+    expect(response.body.uptime).toBeGreaterThanOrEqual(0);
+  });
+
+  it("includes requestId in liveness response when provided", async () => {
+    const app = express();
+    app.get("/live", healthLiveHandler());
+
+    const response = await request(app)
+      .get("/live")
+      .set("x-request-id", "live-req-456");
+
+    expect(response.body.requestId).toBe("live-req-456");
+  });
+});
+
+describe("healthStartupHandler - startup probe", () => {
+  it("returns ready when database is healthy", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 15,
+      pool: {
+        totalCount: 3,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+
+    const app = express();
+    app.get("/startup", healthStartupHandler(mockDbHealth));
+
+    const response = await request(app).get("/startup");
+
+    expect(response.status).toBe(200);
+    expect(response.body.ready).toBe(true);
+    expect(response.body.service).toBe("revora-backend");
+    expect(response.body.check).toBe("database");
+  });
+
+  it("returns 503 when database is not ready during startup", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: false,
+      latencyMs: 5000,
+      error: "timeout",
+    });
+
+    const app = express();
+    app.get("/startup", healthStartupHandler(mockDbHealth));
+    app.use(
+      (
+        err: unknown,
+        _req: express.Request,
+        res: express.Response,
+        _next: express.NextFunction,
+      ) => {
+        const mapped = err as { statusCode: number; toResponse: () => unknown };
+        res.status(mapped.statusCode).json(mapped.toResponse());
+      },
+    );
+
+    const response = await request(app).get("/startup");
+
+    expect(response.status).toBe(503);
+    expect(response.body.code).toBe(ErrorCode.SERVICE_UNAVAILABLE);
+    expect(response.body.details.dependency).toBe("database");
+  });
+});
+
+describe("createHealthRouter - k8s probe endpoints", () => {
+  it("mounts all health endpoints correctly", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 10,
+      pool: {
+        totalCount: 2,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+
+    const router = createHealthRouter(mockDbHealth);
+    const app = express();
+    app.use(router);
+
+    const rootResponse = await request(app).get("/");
+    expect(rootResponse.status).toBe(200);
+
+    const liveResponse = await request(app).get("/live");
+    expect(liveResponse.status).toBe(200);
+    expect(liveResponse.body.alive).toBe(true);
+
+    const readyResponse = await request(app).get("/ready");
+    expect([200, 503]).toContain(readyResponse.status);
+
+    const startupResponse = await request(app).get("/startup");
+    expect([200, 503]).toContain(startupResponse.status);
+  });
+});
+
+describe("dependency graph security", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("never exposes raw database error messages in dependency health", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: false,
+      latencyMs: 100,
+      error: 'password authentication failed for user "admin"',
+      pool: {
+        totalCount: 0,
+        idleCount: 0,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.checks[0].error).toBe("sanitized-db-error");
+    expect(response.body.checks[0].error).not.toContain("password");
+    expect(response.body.checks[0].error).not.toContain("admin");
+    expect(response.body.checks[0].error).not.toContain("authentication");
+  });
+
+  it("exposes only safe Stellar metadata without leaking upstream details", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 20,
+      pool: {
+        totalCount: 2,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: false, status: 503 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.checks[1].name).toBe("stellar-horizon");
+    expect(response.body.checks[1].status).toBe("down");
+    expect(response.body.checks[1].details.failureClass).toBe(
+      StellarRPCFailureClass.UPSTREAM_ERROR,
+    );
+    expect(response.body.checks[1].details.upstreamStatus).toBe(503);
+    expect(response.body.checks[1].details.url).toBeDefined();
+  });
+});
+
+describe("Stellar Horizon timeout handling", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("classifies Stellar timeout correctly", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 10,
+      pool: {
+        totalCount: 2,
+        idleCount: 2,
+        waitingCount: 0,
+        maxConnections: 10,
+      },
+    });
+
+    const timeoutError = new Error("timeout");
+    timeoutError.name = "AbortError";
+    global.fetch = jest.fn().mockRejectedValue(timeoutError) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.checks[1].name).toBe("stellar-horizon");
+    expect(response.body.checks[1].details.failureClass).toBe(
+      StellarRPCFailureClass.TIMEOUT,
+    );
+    expect(response.body.checks[1].error).toBe("timeout");
   });
 });

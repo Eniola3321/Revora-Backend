@@ -1,15 +1,83 @@
 import { NextFunction, Request, Response, Router } from 'express';
 import { Pool } from 'pg';
 import { AppError, Errors } from '../lib/errors';
+import { MetricsCollector } from '../lib/metrics';
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
-} from '../lib/stellarRpcFailure';
+} from "../lib/stellarRpcFailure";
+import { DbHealthResult, PoolMetrics } from "../db/client";
 
-export type HealthDependency = 'database' | 'stellar-horizon';
+export type HealthDependency = "database" | "stellar-horizon" | "db-pool";
+
+export type DependencyStatus = "up" | "down" | "degraded" | "unknown";
+
+export interface DependencyHealth {
+  name: HealthDependency;
+  status: DependencyStatus;
+  latencyMs: number;
+  healthy: boolean;
+  dependsOn?: HealthDependency[];
+  details?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface HealthDependencyGraph {
+  status: "healthy" | "degraded" | "unhealthy";
+  service: string;
+  version: string;
+  timestamp: string;
+  uptime: number;
+  checks: DependencyHealth[];
+  requestId?: string;
+}
 
 interface QueryableDb {
   query(sql: string, params?: unknown[]): Promise<unknown>;
+}
+
+interface DbHealthChecker {
+  (): Promise<DbHealthResult>;
+}
+
+const HORIZON_TIMEOUT_MS = 5000;
+const POOL_HEALTHY_THRESHOLD = 0.8;
+const POOL_DEGRADED_THRESHOLD = 0.9;
+
+function getServiceVersion(): string {
+  return process.env.npm_package_version ?? "0.1.0";
+}
+
+function getUptimeSeconds(): number {
+  return Math.floor(process.uptime());
+}
+
+function calculatePoolUtilization(pool: PoolMetrics | undefined): number {
+  if (!pool || pool.maxConnections === 0) return 0;
+  return pool.totalCount / pool.maxConnections;
+}
+
+function classifyPoolStatus(pool: PoolMetrics | undefined): DependencyStatus {
+  if (!pool) return "unknown";
+  const utilization = calculatePoolUtilization(pool);
+  if (utilization >= POOL_DEGRADED_THRESHOLD) return "degraded";
+  if (utilization >= POOL_HEALTHY_THRESHOLD) return "up";
+  return "up";
+}
+
+function logHealthCheck(
+  level: "info" | "warn" | "error",
+  message: string,
+  data: Record<string, unknown>,
+): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level,
+    component: "health",
+    message,
+    ...data,
+  };
+  console.log(JSON.stringify(logEntry));
 }
 
 /**
@@ -212,265 +280,237 @@ export function mapHealthDependencyFailure(
 ): AppError {
   const details: Record<string, unknown> = { dependency };
 
-  if (dependency === 'stellar-horizon') {
+  if (dependency === "stellar-horizon") {
     const failureClass = classifyStellarRPCFailure(cause);
     details.failureClass = failureClass;
 
-    if (typeof cause === 'object' && cause !== null) {
+    if (typeof cause === "object" && cause !== null) {
       const status = (cause as { status?: unknown }).status;
-      if (typeof status === 'number') {
+      if (typeof status === "number") {
         details.upstreamStatus = status;
       }
     }
   }
 
-  return Errors.serviceUnavailable('Dependency unavailable', details);
+  return Errors.serviceUnavailable("Dependency unavailable", details);
 }
 
+async function checkStellarHorizon(): Promise<DependencyHealth> {
+  const start = Date.now();
+  const horizonUrl =
+    process.env.STELLAR_HORIZON_URL || "https://horizon.stellar.org";
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HORIZON_TIMEOUT_MS);
+
+    const response = await fetch(horizonUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    const latencyMs = Date.now() - start;
+
+    if (!response.ok) {
+      const failureClass = classifyStellarRPCFailure({
+        status: response.status,
+      });
+      logHealthCheck("error", "Stellar Horizon health check failed", {
+        dependency: "stellar-horizon",
+        status: response.status,
+        failureClass,
+        latencyMs,
+      });
+
+      return {
+        name: "stellar-horizon",
+        status: "down",
+        latencyMs,
+        healthy: false,
+        dependsOn: [],
+        details: {
+          failureClass,
+          upstreamStatus: response.status,
+          url: horizonUrl,
+        },
+      };
+    }
+
+    logHealthCheck("info", "Stellar Horizon health check passed", {
+      dependency: "stellar-horizon",
+      latencyMs,
+      status: response.status,
+    });
+
+    return {
+      name: "stellar-horizon",
+      status: "up",
+      latencyMs,
+      healthy: true,
+      dependsOn: [],
+      details: {
+        url: horizonUrl,
+        statusCode: response.status,
+      },
+    };
+  } catch (error) {
+    const latencyMs = Date.now() - start;
+    const failureClass = classifyStellarRPCFailure(error);
+
+    logHealthCheck("error", "Stellar Horizon health check error", {
+      dependency: "stellar-horizon",
+      failureClass,
+      latencyMs,
+      error: error instanceof Error ? error.name : "Unknown",
+    });
+
+    return {
+      name: "stellar-horizon",
+      status: "down",
+      latencyMs,
+      healthy: false,
+      dependsOn: [],
+      details: {
+        failureClass,
+        url: horizonUrl,
+      },
+      error:
+        failureClass === StellarRPCFailureClass.TIMEOUT
+          ? "timeout"
+          : "connection_error",
+    };
+  }
+}
+
+async function checkDatabase(
+  dbHealth: DbHealthChecker,
+): Promise<DependencyHealth> {
+  const result = await dbHealth();
+
+  if (result.healthy) {
+    const poolStatus = classifyPoolStatus(result.pool);
+    const utilization = calculatePoolUtilization(result.pool);
+
+    logHealthCheck("info", "Database health check passed", {
+      dependency: "database",
+      latencyMs: result.latencyMs,
+      poolStatus,
+      utilization: Math.round(utilization * 100),
+    });
+
+    return {
+      name: "database",
+      status: poolStatus,
+      latencyMs: result.latencyMs,
+      healthy: poolStatus !== "down",
+      dependsOn: result.pool ? ["db-pool"] : [],
+      details: result.pool
+        ? {
+            ...result.pool,
+            utilizationPercent: Math.round(utilization * 100),
+          }
+        : undefined,
+    };
+  }
+
+  logHealthCheck("error", "Database health check failed", {
+    dependency: "database",
+    latencyMs: result.latencyMs,
+    error: "sanitized-db-error",
+  });
+
+  return {
+    name: "database",
+    status: "down",
+    latencyMs: result.latencyMs,
+    healthy: false,
+    dependsOn: result.pool ? ["db-pool"] : [],
+    error: "sanitized-db-error",
+  };
+}
+
+function evaluateOverallStatus(
+  checks: DependencyHealth[],
+): "healthy" | "degraded" | "unhealthy" {
+  const hasDown = checks.some((c) => c.status === "down");
+  const hasDegraded = checks.some((c) => c.status === "degraded");
+
+  if (hasDown) return "unhealthy";
+  if (hasDegraded) return "degraded";
+  return "healthy";
+}
+
+export const healthRootHandler =
+  (dbHealth: DbHealthChecker) =>
+  async (req: Request, res: Response): Promise<void> => {
+    const requestId = req.headers["x-request-id"] as string | undefined;
+
+    const [dbCheck, stellarCheck] = await Promise.all([
+      checkDatabase(dbHealth),
+      checkStellarHorizon(),
+    ]);
+
+    const checks = [dbCheck, stellarCheck];
+    const status = evaluateOverallStatus(checks);
+
+    const response: HealthDependencyGraph = {
+      status,
+      service: "revora-backend",
+      version: getServiceVersion(),
+      timestamp: new Date().toISOString(),
+      uptime: getUptimeSeconds(),
+      checks,
+      requestId,
+    };
+
+    const statusCode = status === "unhealthy" ? 503 : 200;
+    res.status(statusCode).json(response);
+  };
+
 export const healthReadyHandler =
-  (db: QueryableDb) =>
+  (db: QueryableDb, metrics?: MetricsCollector) =>
   async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const startTime = Date.now();
+
     try {
       await db.query('SELECT 1');
+      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'success' });
     } catch (dbError) {
+      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'failure' });
       next(mapHealthDependencyFailure('database', dbError));
       return;
     }
 
-    try {
-      const horizonUrl = process.env.STELLAR_HORIZON_URL || 'https://horizon.stellar.org';
-      const response = await fetch(horizonUrl);
+    logHealthCheck("info", "Readiness probe passed", {
+      requestId,
+      latencyMs: Math.max(dbCheck.latencyMs, stellarCheck.latencyMs),
+    });
 
       if (!response.ok) {
+        metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
         next(mapHealthDependencyFailure('stellar-horizon', { status: response.status }));
         return;
       }
+      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'success' });
     } catch (stellarError) {
+      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
       next(mapHealthDependencyFailure('stellar-horizon', stellarError));
       return;
     }
 
+    const duration = Date.now() - startTime;
+    metrics?.recordHistogram('health_check_duration_ms', duration, { endpoint: 'ready' });
+
     res.status(200).json({
-      status: 'ok',
-      db: 'up',
-      stellar: 'up',
+      ready: true,
+      service: "revora-backend",
+      timestamp: new Date().toISOString(),
+      check: dbCheck.name,
+      requestId,
     });
   };
 
-/**
- * Health endpoint handler that provides comprehensive indexer monitoring metrics.
- * 
- * This handler orchestrates parallel queries to the Stellar RPC network and local
- * database to compute real-time health metrics including ledger synchronization
- * status, indexed event counts, uptime tracking, and degradation detection.
- * 
- * The handler executes all queries in parallel using Promise.all() for optimal
- * performance, completing within 5 seconds to support container orchestration.
- * 
- * Error Handling:
- * - RPC failures: Returns degraded status with sanitized error message
- * - Database failures: Returns degraded status with sanitized error message
- * - Partial failures: Returns degraded with available metrics
- * - Timeout: Returns degraded if handler exceeds 5 seconds
- * 
- * @param dependencies - Object containing db, rpcClient, startTime, and optional lagThreshold
- * @returns Express middleware function that handles GET /health requests
- * 
- * @example
- * ```typescript
- * const handler = healthIndexerHandler({
- *   db: pool,
- *   rpcClient: createStellarRpcClient(),
- *   startTime: getIndexerStartTime(),
- *   lagThreshold: 100
- * });
- * 
- * router.get('/health', handler);
- * ```
- */
-export const healthIndexerHandler = (dependencies: {
-  db: QueryableDb;
-  rpcClient: { getLatestLedger(): Promise<{ sequence: number }> };
-  startTime: Date;
-  lagThreshold?: number;
-}) => {
-  return async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const { db, rpcClient, startTime, lagThreshold } = dependencies;
-    
-    // Use provided threshold or read from environment with default of 100
-    const threshold = lagThreshold ?? getHealthLagThreshold();
-    
-    // Create timeout promise that rejects after 5 seconds
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(new Error('Health check timeout exceeded'));
-      }, 5000);
-    });
-    
-    // Create the main health check logic as a promise
-    const healthCheckPromise = (async () => {
-      // Execute all queries in parallel for optimal performance
-      const [
-        currentLedgerResult,
-        indexerStateResult,
-        proposalsCountResult,
-        votesCountResult,
-        delegatesCountResult,
-      ] = await Promise.all([
-        // Query RPC client for current network ledger
-        rpcClient.getLatestLedger().catch((error) => {
-          throw new Error(`RPC client unavailable: ${error.message}`);
-        }),
-        
-        // Query indexer_state table for last indexed ledger
-        db.query('SELECT last_indexed_ledger FROM indexer_state LIMIT 1').catch((error) => {
-          throw new Error(`Database query failed: ${error instanceof Error ? error.message : 'unknown error'}`);
-        }),
-        
-        // Query proposals table for total count
-        db.query('SELECT COUNT(*) as count FROM proposals').catch((error) => {
-          throw new Error(`Proposals count query failed: ${error instanceof Error ? error.message : 'unknown error'}`);
-        }),
-        
-        // Query votes table for total count
-        db.query('SELECT COUNT(*) as count FROM votes').catch((error) => {
-          throw new Error(`Votes count query failed: ${error instanceof Error ? error.message : 'unknown error'}`);
-        }),
-        
-        // Query delegates table for total count
-        db.query('SELECT COUNT(*) as count FROM delegates').catch((error) => {
-          throw new Error(`Delegates count query failed: ${error instanceof Error ? error.message : 'unknown error'}`);
-        }),
-      ]);
-      
-      // Extract values from query results
-      const currentLedger = currentLedgerResult.sequence;
-      const lastIndexedLedger = (indexerStateResult as any).rows?.[0]?.last_indexed_ledger ?? 0;
-      const totalProposalsIndexed = parseInt((proposalsCountResult as any).rows?.[0]?.count ?? '0', 10);
-      const totalVotesIndexed = parseInt((votesCountResult as any).rows?.[0]?.count ?? '0', 10);
-      const totalDelegatesIndexed = parseInt((delegatesCountResult as any).rows?.[0]?.count ?? '0', 10);
-      
-      // Calculate lag metrics
-      const { lagLedgers, lagSeconds } = calculateLag(currentLedger, lastIndexedLedger);
-      
-      // Calculate uptime
-      const uptimeSeconds = calculateUptimeSeconds(startTime);
-      
-      // Determine health status
-      const status = determineHealthStatus(lagLedgers, threshold, false);
-      
-      // Generate ISO 8601 UTC timestamp
-      const timestamp = new Date().toISOString();
-      
-      // Build response object
-      const response = {
-        status,
-        last_indexed_ledger: lastIndexedLedger,
-        current_ledger: currentLedger,
-        lag_ledgers: lagLedgers,
-        lag_seconds: lagSeconds,
-        total_proposals_indexed: totalProposalsIndexed,
-        total_votes_indexed: totalVotesIndexed,
-        total_delegates_indexed: totalDelegatesIndexed,
-        uptime_seconds: uptimeSeconds,
-        timestamp,
-      };
-      
-      // Set HTTP status code based on health status
-      const httpStatus = status === 'ok' ? 200 : 503;
-      res.status(httpStatus).json(response);
-    })();
-    
-    try {
-      // Race between health check and timeout
-      await Promise.race([healthCheckPromise, timeoutPromise]);
-    } catch (error) {
-      // Handle all errors with degraded status
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      
-      // Calculate uptime even in error case
-      const uptimeSeconds = calculateUptimeSeconds(startTime);
-      const timestamp = new Date().toISOString();
-      
-      // Return degraded response with error information
-      const response = {
-        status: 'degraded' as const,
-        last_indexed_ledger: 0,
-        current_ledger: 0,
-        lag_ledgers: 0,
-        lag_seconds: 0,
-        total_proposals_indexed: 0,
-        total_votes_indexed: 0,
-        total_delegates_indexed: 0,
-        uptime_seconds: uptimeSeconds,
-        timestamp,
-        error: errorMessage,
-      };
-      
-      res.status(503).json(response);
-    }
-  };
-};
-
-/**
- * Creates and configures the health router with monitoring endpoints.
- * 
- * This function initializes the Express router with two health check endpoints:
- * - GET /ready: Basic readiness check for database and Stellar Horizon connectivity
- * - GET /health: Comprehensive indexer health metrics with lag monitoring
- * 
- * The /health endpoint requires a Stellar RPC client to query network state.
- * The client is initialized lazily on first request using the STELLAR_RPC_URL environment variable.
- * 
- * @param db - Database connection pool for executing health check queries
- * @returns Express Router configured with health check endpoints
- * 
- * @example
- * ```typescript
- * import { Pool } from 'pg';
- * import { createHealthRouter } from './routes/health';
- * 
- * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- * const healthRouter = createHealthRouter(pool);
- * 
- * app.use('/health', healthRouter);
- * // Endpoints available at:
- * // - GET /health/ready
- * // - GET /health/health
- * ```
- */
-export const createHealthRouter = (db: QueryableDb): Router => {
+export const createHealthRouter = (db: QueryableDb, metrics?: MetricsCollector): Router => {
   const router = Router();
-  
-  // Mount basic readiness check endpoint
-  router.get('/ready', healthReadyHandler(db));
-  
-  // Lazy initialization of RPC client to avoid loading Stellar SDK during module import
-  let rpcClient: { getLatestLedger(): Promise<{ sequence: number }> } | null = null;
-  
-  const getRpcClient = () => {
-    if (!rpcClient) {
-      // Import is done inline to avoid circular dependencies and allow mocking
-      const { createStellarRpcClient } = require('../lib/stellarRpcClient');
-      rpcClient = createStellarRpcClient({
-        serverUrl: process.env.STELLAR_RPC_URL,
-        timeout: 5000,
-      });
-    }
-    return rpcClient;
-  };
-  
-  // Mount comprehensive indexer health endpoint with lazy RPC client initialization
-  router.get('/health', (req, res, next) => {
-    const handler = healthIndexerHandler({
-      db,
-      rpcClient: getRpcClient(),
-      startTime: getIndexerStartTime(),
-      lagThreshold: getHealthLagThreshold(),
-    });
-    return handler(req, res, next);
-  });
-  
+  router.get('/ready', healthReadyHandler(db, metrics));
   return router;
 };
 

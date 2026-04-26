@@ -1,5 +1,10 @@
-import { createHmac, randomUUID } from 'crypto';
-import { Logger } from '../lib/logger';
+import { randomUUID } from 'crypto';
+import {
+  signPayload,
+  WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TIMESTAMP_HEADER,
+  WEBHOOK_EVENT_HEADER,
+} from '../lib/webhookSignature';
 
 export const WebhookEventType = {
   OFFERING_CREATED: 'offering.created',
@@ -46,13 +51,8 @@ export interface WebhookServiceOptions {
   logger?: Logger;
 }
 
-/**
- * Signs a webhook payload body with HMAC-SHA256.
- * Returns a string of the form `sha256=<hex>`.
- */
-export function signPayload(secret: string, body: string): string {
-  return 'sha256=' + createHmac('sha256', secret).update(body).digest('hex');
-}
+// Re-export signPayload so existing consumers keep working.
+export { signPayload } from '../lib/webhookSignature';
 
 /**
  * Fire-and-forget webhook delivery service with retry logic.
@@ -160,14 +160,16 @@ export class WebhookService {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
+        const timestamp = Date.now().toString();
         let response: Response;
         try {
           response = await fetch(endpoint.url, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'X-Revora-Signature': signPayload(endpoint.secret, body),
-              'X-Revora-Event': payload.event,
+              [WEBHOOK_SIGNATURE_HEADER]: signPayload(endpoint.secret, body, timestamp),
+              [WEBHOOK_TIMESTAMP_HEADER]: timestamp,
+              [WEBHOOK_EVENT_HEADER]: payload.event,
             },
             body,
             signal: controller.signal,
