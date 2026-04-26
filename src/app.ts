@@ -19,11 +19,13 @@ import { MetricsCollector } from './lib/metrics';
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
   constructor(private dbUserRepository: UserRepository) {}
-  
-  async findByEmail(email: string): Promise<import('./auth/login/types').UserRecord | null> {
+
+  async findByEmail(
+    email: string,
+  ): Promise<import("./auth/login/types").UserRecord | null> {
     const user = await this.dbUserRepository.findByEmail(email);
     if (!user) return null;
-    
+
     return {
       id: user.id,
       email: user.email,
@@ -36,8 +38,13 @@ class UserRepositoryAdapter implements IUserRepository {
 // Adapter to convert database SessionRepository to login service SessionRepository
 class SessionRepositoryAdapter implements ISessionRepository {
   constructor(private dbSessionRepository: SessionRepository) {}
-  
-  async createSession(input: { id: string; userId: string; tokenHash: string; expiresAt: Date; }): Promise<void> {
+
+  async createSession(input: {
+    id: string;
+    userId: string;
+    tokenHash: string;
+    expiresAt: Date;
+  }): Promise<void> {
     await this.dbSessionRepository.createSession({
       id: input.id,
       user_id: input.userId,
@@ -55,19 +62,19 @@ class JwtIssuerImpl implements JwtIssuer {
         sid: payload.sessionId,
         role: payload.role,
       },
-      expiresIn: '1h',
+      expiresIn: "1h",
     });
-    
+
     const refreshToken = issueToken({
       subject: payload.userId,
       additionalPayload: {
         sid: payload.sessionId,
         role: payload.role,
-        type: 'refresh',
+        type: "refresh",
       },
-      expiresIn: '7d',
+      expiresIn: "7d",
     });
-    
+
     return { accessToken, refreshToken };
   }
 }
@@ -77,7 +84,7 @@ export function createApp() {
 
   app.use(createCorsMiddleware());
   app.use(express.json());
-  app.use(morgan('dev'));
+  app.use(morgan("dev"));
 
   // Initialize metrics collector
   const metrics = new MetricsCollector({
@@ -91,7 +98,11 @@ export function createApp() {
 
   const userRepository = new UserRepository(pool);
   const jwtIssuer = new JwtIssuerImpl();
-  const loginService = new LoginService(new UserRepositoryAdapter(userRepository), new SessionRepositoryAdapter(sessionRepository), jwtIssuer);
+  const loginService = new LoginService(
+    new UserRepositoryAdapter(userRepository),
+    new SessionRepositoryAdapter(sessionRepository),
+    jwtIssuer,
+  );
 
   // Refresh service
   const refreshTokenRepository = new RefreshTokenRepositoryAdapter(sessionRepository);
