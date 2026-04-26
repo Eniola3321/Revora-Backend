@@ -10,9 +10,18 @@ import { Pool } from 'pg';
 import { RevenueReportRepository, RevenueReport } from '../db/repositories/revenueReportRepository';
 import { DistributionRepository, DistributionRun, Payout } from '../db/repositories/distributionRepository';
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
-import { Logger, LogLevel } from '../lib/logger';
-import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
+import { OfferingRepository } from '../db/repositories/offeringRepository';
+import { logger } from '../lib/logger';
+import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
+
+export interface OnChainRevenueState {
+  totalDistributed: string;
+}
+
+export interface StellarRevenueClient {
+  getRevenueState(contractAddress: string): Promise<OnChainRevenueState>;
+}
 
 export interface ReconciliationDiscrepancy {
   type: DiscrepancyType;
@@ -32,12 +41,10 @@ export type DiscrepancyType =
   | 'MISSING_PAYOUT'
   | 'DUPLICATE_PAYOUT'
   | 'OVERPAYMENT'
-  | 'UNDERPAYMENT'
+  | 'UNDERPAMENT'
   | 'DISTRIBUTION_STATUS_INVALID'
-  | 'CHAIN_EVENT_VALIDATION_FAILED'
-  | 'CHAIN_EVENT_MISMATCH'
-  | 'STELLAR_TX_NOT_FOUND'
-  | 'STELLAR_TX_FAILED';
+  | 'CHAIN_DRIFT_DETECTED'
+  | 'RPC_ERROR';
 
 export interface ReconciliationResult {
   offeringId: string;
@@ -56,6 +63,11 @@ export interface ReconciliationSummary {
   investorCount: number;
   payoutsProcessed: number;
   payoutsFailed: number;
+  chainDrift?: {
+    onChainAmount: string;
+    localAmount: string;
+    drift: string;
+  };
 }
 
 export interface ReconciliationOptions {
@@ -69,16 +81,16 @@ export interface ReconciliationOptions {
 const DEFAULT_TOLERANCE = 0.01;
 
 export class RevenueReconciliationService {
-  private readonly revenueReportRepo: RevenueReportRepository;
-  private readonly distributionRepo: DistributionRepository;
-  private readonly investmentRepo: InvestmentRepository;
-  private readonly logger?: Logger;
+  private readonly offeringRepo: OfferingRepository;
 
-  constructor(private readonly db: Pool, logger?: Logger) {
+  constructor(
+    private readonly db: Pool,
+    private readonly stellarClient?: StellarRevenueClient
+  ) {
     this.revenueReportRepo = new RevenueReportRepository(db);
     this.distributionRepo = new DistributionRepository(db);
     this.investmentRepo = new InvestmentRepository(db);
-    this.logger = logger;
+    this.offeringRepo = new OfferingRepository(db);
   }
 
   /**
@@ -134,8 +146,46 @@ export class RevenueReconciliationService {
         LogLevel.DEBUG
       );
 
-      const totalRevenueReported = this.sumRevenueAmounts(relevantReports);
-      const totalPayouts = this.sumDistributionAmounts(relevantRuns);
+    // Drift Detection
+    if (this.stellarClient) {
+      try {
+        const driftResult = await this.detectChainDrift(offeringId);
+        if (driftResult.hasDrift) {
+          discrepancies.push({
+            type: 'CHAIN_DRIFT_DETECTED',
+            severity: parseFloat(driftResult.drift) > tolerance * 10 ? 'critical' : 'error',
+            message: `On-chain drift detected for offering ${offeringId}: local ${driftResult.localAmount} vs chain ${driftResult.onChainAmount}`,
+            details: driftResult,
+            offeringId,
+          });
+
+          logger.error('Revenue reconciliation drift detected', {
+            offeringId,
+            ...driftResult,
+          });
+        }
+      } catch (error) {
+        const failureClass = classifyStellarRPCFailure(error);
+        discrepancies.push({
+          type: 'RPC_ERROR',
+          severity: 'warning',
+          message: `Failed to fetch on-chain state: ${failureClass}`,
+          details: { error: String(error), failureClass },
+          offeringId,
+        });
+
+        logger.warn('Failed to fetch on-chain state during reconciliation', {
+          offeringId,
+          failureClass,
+          error: String(error),
+        });
+      }
+    }
+
+    for (const run of relevantRuns) {
+      const payoutCheck = await this.checkDistributionRunIntegrity(run, tolerance);
+      discrepancies.push(...payoutCheck);
+    }
 
       const revenueMismatch = this.checkRevenueMismatch(
         totalRevenueReported,
@@ -291,45 +341,15 @@ export class RevenueReconciliationService {
         discrepancies,
         summary: {
           totalRevenueReported,
-          totalPayouts,
-          discrepancyAmount: this.calculateDiscrepancyAmount(
-            totalRevenueReported,
-            totalPayouts
-          ),
-          investorCount: investorIds.size,
-          payoutsProcessed: this.countProcessedPayouts(relevantRuns),
-          payoutsFailed: totalFailedPayouts,
-        },
-        checkedAt: new Date(),
-      };
-
-      this.logger?.info(
-        'Reconciliation completed',
-        {
-          offeringId,
-          isBalanced: result.isBalanced,
-          discrepanciesCount: discrepancies.length,
-          errorsCount: discrepancies.filter(d => d.severity === 'error' || d.severity === 'critical').length,
-          warningsCount: discrepancies.filter(d => d.severity === 'warning').length,
-        },
-        LogLevel.INFO
-      );
-
-      return result;
-    } catch (error) {
-      this.logger?.error(
-        'Reconciliation process failed',
-        {
-          offeringId,
-          periodStart,
-          periodEnd,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        },
-        LogLevel.ERROR
-      );
-      
-      throw Errors.internal('Reconciliation process failed', error instanceof Error ? error.message : 'Unknown error');
-    }
+          totalPayouts
+        ),
+        investorCount: investorIds.size,
+        payoutsProcessed: this.countProcessedPayouts(relevantRuns),
+        payoutsFailed: totalFailedPayouts,
+        chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
+      },
+      checkedAt: new Date(),
+    };
   }
 
   /**
@@ -426,6 +446,46 @@ export class RevenueReconciliationService {
     return {
       isValid: errors.length === 0,
       errors,
+    };
+  }
+
+  /**
+   * Detect drift between local DB and on-chain state
+   */
+  async detectChainDrift(offeringId: string): Promise<{
+    hasDrift: boolean;
+    onChainAmount: string;
+    localAmount: string;
+    drift: string;
+  }> {
+    if (!this.stellarClient) {
+      throw Errors.internal('Stellar client not configured for drift detection');
+    }
+
+    const offering = await this.offeringRepo.findById(offeringId);
+    if (!offering || !offering.contract_address) {
+      return {
+        hasDrift: false,
+        onChainAmount: '0.00',
+        localAmount: '0.00',
+        drift: '0.00',
+      };
+    }
+
+    const onChainState = await this.stellarClient.getRevenueState(offering.contract_address);
+    const stats = await this.distributionRepo.getAggregateStats(offeringId);
+
+    const onChainAmount = parseFloat(onChainState.totalDistributed);
+    const localAmount = parseFloat(stats.totalDistributed);
+    const drift = Math.abs(onChainAmount - localAmount);
+
+    const hasDrift = drift > DEFAULT_TOLERANCE;
+
+    return {
+      hasDrift,
+      onChainAmount: onChainAmount.toFixed(2),
+      localAmount: localAmount.toFixed(2),
+      drift: drift.toFixed(2),
     };
   }
 

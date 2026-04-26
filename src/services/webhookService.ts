@@ -1,4 +1,10 @@
-import { createHmac, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
+import {
+  signPayload,
+  WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TIMESTAMP_HEADER,
+  WEBHOOK_EVENT_HEADER,
+} from '../lib/webhookSignature';
 
 export const WebhookEventType = {
   OFFERING_CREATED: 'offering.created',
@@ -42,15 +48,11 @@ export interface WebhookServiceOptions {
   maxRetries?: number;
   initialDelayMs?: number;
   timeoutMs?: number;
+  logger?: Logger;
 }
 
-/**
- * Signs a webhook payload body with HMAC-SHA256.
- * Returns a string of the form `sha256=<hex>`.
- */
-export function signPayload(secret: string, body: string): string {
-  return 'sha256=' + createHmac('sha256', secret).update(body).digest('hex');
-}
+// Re-export signPayload so existing consumers keep working.
+export { signPayload } from '../lib/webhookSignature';
 
 /**
  * Fire-and-forget webhook delivery service with retry logic.
@@ -69,6 +71,7 @@ export class WebhookService {
   private readonly maxRetries: number;
   private readonly initialDelayMs: number;
   private readonly timeoutMs: number;
+  private readonly logger: Logger;
 
   constructor(
     private readonly endpointRepo: IWebhookEndpointRepository,
@@ -77,6 +80,7 @@ export class WebhookService {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 1000;
     this.timeoutMs = options.timeoutMs ?? 10000;
+    this.logger = options.logger ?? new Logger({ serviceName: 'webhook-service' });
   }
 
   /**
@@ -87,7 +91,10 @@ export class WebhookService {
     try {
       endpoints = await this.endpointRepo.listActiveByEvent(event);
     } catch (err) {
-      console.error('[WebhookService] Failed to fetch endpoints for event:', event, err);
+      this.logger.error('Failed to fetch webhook endpoints', {
+        event,
+        error: err,
+      });
       return;
     }
 
@@ -98,9 +105,21 @@ export class WebhookService {
       timestamp: new Date().toISOString(),
     };
 
+    this.logger.info('Emitting webhook event', {
+      event,
+      payloadId: payload.id,
+      endpointCount: endpoints.length,
+    });
+
     for (const endpoint of endpoints) {
       void this.deliver(endpoint, payload).catch((err) => {
-        console.error('[WebhookService] Delivery error for endpoint', endpoint.id, err);
+        this.logger.error('Webhook delivery error', {
+          endpointId: endpoint.id,
+          endpointUrl: endpoint.url,
+          event,
+          payloadId: payload.id,
+          error: err,
+        });
       });
     }
   }
@@ -117,9 +136,21 @@ export class WebhookService {
     let lastStatusCode: number | undefined;
     let lastError: string | undefined;
 
+    this.logger.debug('Starting webhook delivery', {
+      endpointId: endpoint.id,
+      endpointUrl: endpoint.url,
+      event: payload.event,
+      payloadId: payload.id,
+    });
+
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       if (attempt > 1) {
         const delay = this.initialDelayMs * Math.pow(2, attempt - 2);
+        this.logger.debug('Retrying webhook delivery', {
+          endpointId: endpoint.id,
+          attempt,
+          delayMs: delay,
+        });
         await new Promise<void>((resolve) => setTimeout(resolve, delay));
       }
 
@@ -129,14 +160,16 @@ export class WebhookService {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
+        const timestamp = Date.now().toString();
         let response: Response;
         try {
           response = await fetch(endpoint.url, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'X-Revora-Signature': signPayload(endpoint.secret, body),
-              'X-Revora-Event': payload.event,
+              [WEBHOOK_SIGNATURE_HEADER]: signPayload(endpoint.secret, body, timestamp),
+              [WEBHOOK_TIMESTAMP_HEADER]: timestamp,
+              [WEBHOOK_EVENT_HEADER]: payload.event,
             },
             body,
             signal: controller.signal,
@@ -148,6 +181,14 @@ export class WebhookService {
         lastStatusCode = response.status;
 
         if (response.ok) {
+          this.logger.info('Webhook delivered successfully', {
+            endpointId: endpoint.id,
+            endpointUrl: endpoint.url,
+            event: payload.event,
+            payloadId: payload.id,
+            attempts,
+            statusCode: response.status,
+          });
           return {
             endpointId: endpoint.id,
             url: endpoint.url,
@@ -159,6 +200,14 @@ export class WebhookService {
 
         // 4xx (except 429 Too Many Requests) are non-retryable
         if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          this.logger.warn('Webhook delivery failed with non-retryable error', {
+            endpointId: endpoint.id,
+            endpointUrl: endpoint.url,
+            event: payload.event,
+            payloadId: payload.id,
+            statusCode: response.status,
+            attempts,
+          });
           return {
             endpointId: endpoint.id,
             url: endpoint.url,
@@ -170,10 +219,30 @@ export class WebhookService {
         }
 
         lastError = `HTTP ${response.status}`;
+        this.logger.warn('Webhook delivery attempt failed', {
+          endpointId: endpoint.id,
+          attempt,
+          statusCode: response.status,
+        });
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
+        this.logger.warn('Webhook delivery attempt error', {
+          endpointId: endpoint.id,
+          attempt,
+          error: err,
+        });
       }
     }
+
+    this.logger.error('Webhook delivery failed after all retries', {
+      endpointId: endpoint.id,
+      endpointUrl: endpoint.url,
+      event: payload.event,
+      payloadId: payload.id,
+      attempts,
+      lastStatusCode,
+      lastError,
+    });
 
     return {
       endpointId: endpoint.id,
