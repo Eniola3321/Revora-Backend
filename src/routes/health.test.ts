@@ -11,6 +11,8 @@ import { closePool } from '../db/client';
 import { ErrorCode } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
 import {
+  calculateLag,
+  calculateUptimeSeconds,
   createHealthRouter,
   healthLiveHandler,
   healthReadyHandler,
