@@ -171,6 +171,24 @@ export class RevenueReportRepository {
     return result.rows.map((row) => this.mapRevenueReport(row));
   }
 
+  /**
+   * Find approved revenue reports that have not been successfully distributed yet.
+   */
+  async findApprovedWithoutDistribution(): Promise<RevenueReport[]> {
+    const query = `
+      SELECT r.*
+      FROM revenue_reports r
+      LEFT JOIN distributions d ON d.period_id = r.id
+      WHERE r.status = 'approved'
+        AND (d.id IS NULL OR d.status != 'completed')
+      ORDER BY r.created_at ASC
+    `;
+
+    const result: QueryResult<RevenueReportRow> = await this.db.query(query);
+
+    return result.rows.map((row) => this.mapRevenueReport(row));
+  }
+
   private mapRevenueReport(row: RevenueReportRow): RevenueReport {
     return {
       ...(row as RevenueReport),

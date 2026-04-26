@@ -281,7 +281,9 @@ export function mapHealthDependencyFailure(
   const details: Record<string, unknown> = { dependency };
 
   if (dependency === "stellar-horizon") {
-    const failureClass = classifyStellarRPCFailure(cause);
+    const failureClass = classifyStellarRPCFailure(cause, {
+      operation: "health-check",
+    }).class;
     details.failureClass = failureClass;
 
     if (typeof cause === "object" && cause !== null) {
@@ -310,9 +312,12 @@ async function checkStellarHorizon(): Promise<DependencyHealth> {
     const latencyMs = Date.now() - start;
 
     if (!response.ok) {
-      const failureClass = classifyStellarRPCFailure({
-        status: response.status,
-      });
+      const failureClass = classifyStellarRPCFailure(
+        {
+          status: response.status,
+        },
+        { operation: "health-check" },
+      ).class;
       logHealthCheck("error", "Stellar Horizon health check failed", {
         dependency: "stellar-horizon",
         status: response.status,
@@ -353,7 +358,9 @@ async function checkStellarHorizon(): Promise<DependencyHealth> {
     };
   } catch (error) {
     const latencyMs = Date.now() - start;
-    const failureClass = classifyStellarRPCFailure(error);
+    const failureClass = classifyStellarRPCFailure(error, {
+      operation: "health-check",
+    }).class;
 
     logHealthCheck("error", "Stellar Horizon health check error", {
       dependency: "stellar-horizon",
@@ -465,52 +472,138 @@ export const healthRootHandler =
     res.status(statusCode).json(response);
   };
 
-export const healthReadyHandler =
-  (db: QueryableDb, metrics?: MetricsCollector) =>
-  async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const startTime = Date.now();
-
-    try {
-      await db.query('SELECT 1');
-      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'success' });
-    } catch (dbError) {
-      metrics?.incrementCounter('health_checks_total', { check: 'database', status: 'failure' });
-      next(mapHealthDependencyFailure('database', dbError));
-      return;
-    }
-
-    logHealthCheck("info", "Readiness probe passed", {
-      requestId,
-      latencyMs: Math.max(dbCheck.latencyMs, stellarCheck.latencyMs),
-    });
-
-      if (!response.ok) {
-        metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
-        next(mapHealthDependencyFailure('stellar-horizon', { status: response.status }));
-        return;
-      }
-      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'success' });
-    } catch (stellarError) {
-      metrics?.incrementCounter('health_checks_total', { check: 'stellar-horizon', status: 'failure' });
-      next(mapHealthDependencyFailure('stellar-horizon', stellarError));
-      return;
-    }
-
-    const duration = Date.now() - startTime;
-    metrics?.recordHistogram('health_check_duration_ms', duration, { endpoint: 'ready' });
-
+export const healthLiveHandler =
+  () =>
+  async (req: Request, res: Response): Promise<void> => {
+    const requestId = req.headers["x-request-id"] as string | undefined;
     res.status(200).json({
-      ready: true,
+      status: "ok",
+      alive: true,
       service: "revora-backend",
       timestamp: new Date().toISOString(),
-      check: dbCheck.name,
+      uptime: Math.floor(process.uptime()),
       requestId,
     });
   };
 
-export const createHealthRouter = (db: QueryableDb, metrics?: MetricsCollector): Router => {
+export const healthStartupHandler =
+  (dbHealth: DbHealthChecker) =>
+  async (req: Request, res: Response): Promise<void> => {
+    const requestId = req.headers["x-request-id"] as string | undefined;
+    const result = await dbHealth();
+
+    if (result.healthy) {
+      res.status(200).json({
+        status: "ok",
+        ready: true,
+        service: "revora-backend",
+        timestamp: new Date().toISOString(),
+        requestId,
+        check: "database",
+      });
+    } else {
+      res.status(503).json({
+        status: "down",
+        ready: false,
+        service: "revora-backend",
+        timestamp: new Date().toISOString(),
+        requestId,
+        code: "SERVICE_UNAVAILABLE",
+        details: { dependency: "database" },
+      });
+    }
+  };
+
+export const healthReadyHandler =
+  (db: QueryableDb, metrics?: MetricsCollector) =>
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const startTime = Date.now();
+    const requestId = req.headers["x-request-id"] as string | undefined;
+
+    try {
+      // 1. Check Database
+      try {
+        await db.query("SELECT 1");
+        metrics?.incrementCounter("health_checks_total", {
+          check: "database",
+          status: "success",
+        });
+      } catch (dbError) {
+        if (dbError instanceof AppError) {
+          throw dbError;
+        }
+        metrics?.incrementCounter("health_checks_total", {
+          check: "database",
+          status: "failure",
+        });
+        throw mapHealthDependencyFailure("database", dbError);
+      }
+
+      // 2. Check Stellar Horizon
+      const horizonUrl =
+        process.env.STELLAR_HORIZON_URL || "https://horizon.stellar.org";
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(
+          () => controller.abort(),
+          HORIZON_TIMEOUT_MS,
+        );
+        const response = await fetch(horizonUrl, { signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          metrics?.incrementCounter("health_checks_total", {
+            check: "stellar-horizon",
+            status: "failure",
+          });
+          throw mapHealthDependencyFailure("stellar-horizon", {
+            status: response.status,
+          });
+        }
+        metrics?.incrementCounter("health_checks_total", {
+          check: "stellar-horizon",
+          status: "success",
+        });
+      } catch (stellarError) {
+        if (stellarError instanceof AppError) {
+          throw stellarError;
+        }
+        metrics?.incrementCounter("health_checks_total", {
+          check: "stellar-horizon",
+          status: "failure",
+        });
+        throw mapHealthDependencyFailure("stellar-horizon", stellarError);
+      }
+
+      const duration = Date.now() - startTime;
+      metrics?.recordHistogram("health_check_duration_ms", duration, {
+        endpoint: "ready",
+      });
+
+      res.status(200).json({
+        status: "ok",
+        ready: true,
+        service: "revora-backend",
+        db: "up",
+        stellar: "up",
+        timestamp: new Date().toISOString(),
+        requestId,
+      });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+export const createHealthRouter = (
+  db: QueryableDb,
+  dbHealth: DbHealthChecker,
+  metrics?: MetricsCollector,
+): Router => {
   const router = Router();
-  router.get('/ready', healthReadyHandler(db, metrics));
+  router.get("/", healthRootHandler(dbHealth));
+  router.get("/live", healthLiveHandler());
+  router.get("/ready", healthReadyHandler(db, metrics));
+  router.get("/startup", healthStartupHandler(dbHealth));
   return router;
 };
 

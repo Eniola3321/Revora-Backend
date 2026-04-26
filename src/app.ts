@@ -10,6 +10,7 @@ import { createLogoutRouter } from './auth/logout/logoutRoute';
 import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
 import { createLoginRouter } from './auth/login/loginRoute';
 import { createHealthRouter } from './routes/health';
+import { dbHealth } from './db/client';
 import { createOfferingSyncRouter } from './routes/offeringSync';
 import { UserRepository } from './db/repositories/userRepository';
 import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionRepository as ISessionRepository } from './auth/login/types';
@@ -116,7 +117,7 @@ export function createApp() {
   app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
-  app.use('/api/v1/health', createHealthRouter(pool, metrics));
+  app.use('/api/v1/health', createHealthRouter(pool, dbHealth, metrics));
 
   // Offering sync routes
   app.use('/api/v1/offerings', createOfferingSyncRouter());
