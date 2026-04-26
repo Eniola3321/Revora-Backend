@@ -23,7 +23,12 @@ export interface ChangePasswordResult {
 
 // ── Service ───────────────────────────────────────────────────────────────────
 export class ChangePasswordService {
-  constructor(private readonly userRepo: ChangePasswordUserRepo) {}
+  constructor(
+    private readonly userRepo: ChangePasswordUserRepo,
+    private readonly sessionRepo: SessionRepository,
+    private readonly db: Pool,
+    private readonly logger: Logger = new Logger({ serviceName: 'change-password' })
+  ) {}
 
   async execute(input: ChangePasswordInput): Promise<ChangePasswordResult> {
     const { userId, currentPassword, newPassword } = input;
@@ -58,10 +63,17 @@ export class ChangePasswordService {
       throw Errors.badRequest('Current password is incorrect.');
     }
 
-    // Hash and persist
-    const newHash = await hashPassword(newPassword);
-    await this.userRepo.updatePasswordHash(userId, newHash);
+      this.logger.info('Password changed and sessions invalidated', {
+        userId,
+      });
 
-    return { ok: true };
+      return { ok: true };
+    }).catch((error) => {
+      this.logger.error('Password change failed', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    });
   }
 }

@@ -118,4 +118,4 @@ describe('ChangePasswordService', () => {
       expect(err.details.errors.length).toBeGreaterThan(0);
     }
   });
-});
+});

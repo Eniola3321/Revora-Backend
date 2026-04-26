@@ -93,8 +93,15 @@ export function createApp() {
   const jwtIssuer = new JwtIssuerImpl();
   const loginService = new LoginService(new UserRepositoryAdapter(userRepository), new SessionRepositoryAdapter(sessionRepository), jwtIssuer);
 
+  // Refresh service
+  const refreshTokenRepository = new RefreshTokenRepositoryAdapter(sessionRepository);
+  const tokenService = new JwtTokenServiceAdapter();
+  const logger = new Logger({ serviceName: 'auth-refresh' });
+  const refreshService = new RefreshService(refreshTokenRepository, tokenService, pool, logger);
+
   // Auth and health routes
   app.use(createLoginRouter({ loginService }));
+  app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
   app.use('/api/v1/health', createHealthRouter(pool, metrics));
