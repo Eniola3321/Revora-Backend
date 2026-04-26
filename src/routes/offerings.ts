@@ -70,8 +70,24 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
   async function listCatalog(req: Request, res: Response, next: NextFunction) {
     try {
       const status = typeof req.query.status === 'string' ? req.query.status : undefined;
-      const limit = req.query.limit ? Math.max(0, parseInt(String(req.query.limit), 10) || 0) : undefined;
-      const offset = req.query.offset ? Math.max(0, parseInt(String(req.query.offset), 10) || 0) : undefined;
+      let limit: number | undefined;
+      if (req.query.limit !== undefined) {
+        limit = parseInt(String(req.query.limit), 10);
+        if (isNaN(limit) || limit < 0 || limit > 1000) {
+          globalLogger.warn('Invalid limit parameter', { limit: req.query.limit });
+          return next(Errors.badRequest('Invalid limit parameter'));
+        }
+      }
+
+      let offset: number | undefined;
+      if (req.query.offset !== undefined) {
+        offset = parseInt(String(req.query.offset), 10);
+        if (isNaN(offset) || offset < 0) {
+          globalLogger.warn('Invalid offset parameter', { offset: req.query.offset });
+          return next(Errors.badRequest('Invalid offset parameter'));
+        }
+      }
+      
       const sort = typeof req.query.sort === 'string' ? req.query.sort : undefined;
 
       if (typeof offeringRepo.listPublic !== 'function') {
@@ -84,6 +100,11 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
       if (typeof offeringRepo.countPublic === 'function') {
         result.total = await offeringRepo.countPublic({ status });
       }
+
+      globalLogger.info('Catalog list fetched', { 
+        status, limit, offset, sort, count: offerings.length 
+      });
+
       return res.json(result);
     } catch (err) {
       return next(err);
@@ -111,6 +132,12 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
         typeof user.id === 'string' &&
         (user.role === 'startup' || user.role === 'issuer') &&
         user.id === offeringIssuerId;
+
+      globalLogger.info('Offering detail fetched', { 
+        id, 
+        isIssuer, 
+        userId: user?.id 
+      });
 
       return res.json(isIssuer ? offering : toPublicOffering(offering));
     } catch (err) {

@@ -148,7 +148,7 @@ export class OfferingRepository {
       SELECT id, name, symbol, title, contract_address, status, total_raised, target_amount, created_at, updated_at
       FROM offerings
       WHERE status IN (${statusPlaceholders})
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC, id ASC
       LIMIT $${statuses.length + 1} OFFSET $${statuses.length + 2}
     `;
 
