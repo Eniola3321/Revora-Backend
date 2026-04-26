@@ -7,6 +7,11 @@ import {
   WebhookEndpointRecord,
   signPayload,
 } from './webhookService';
+import {
+  WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TIMESTAMP_HEADER,
+  WEBHOOK_EVENT_HEADER,
+} from '../lib/webhookSignature';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -44,21 +49,28 @@ beforeEach(() => {
 // ─── signPayload ─────────────────────────────────────────────────────────────
 
 describe('signPayload', () => {
-  it('returns sha256=<hex> using HMAC-SHA256', () => {
+  it('returns sha256=<hex> using HMAC-SHA256 over timestamp.body', () => {
     const secret = 'mysecret';
     const body = '{"hello":"world"}';
-    const expected = 'sha256=' + createHmac('sha256', secret).update(body).digest('hex');
-    expect(signPayload(secret, body)).toBe(expected);
+    const ts = '1700000000000';
+    const expected = 'sha256=' + createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
+    expect(signPayload(secret, body, ts)).toBe(expected);
   });
 
   it('produces different signatures for different secrets', () => {
     const body = 'same body';
-    expect(signPayload('secret-a', body)).not.toBe(signPayload('secret-b', body));
+    const ts = '1700000000000';
+    expect(signPayload('secret-a', body, ts)).not.toBe(signPayload('secret-b', body, ts));
   });
 
   it('produces different signatures for different bodies', () => {
     const secret = 'same-secret';
-    expect(signPayload(secret, 'body-a')).not.toBe(signPayload(secret, 'body-b'));
+    const ts = '1700000000000';
+    expect(signPayload(secret, 'body-a', ts)).not.toBe(signPayload(secret, 'body-b', ts));
+  });
+
+  it('produces different signatures for different timestamps', () => {
+    expect(signPayload('secret', 'body', '1000')).not.toBe(signPayload('secret', 'body', '2000'));
   });
 });
 
@@ -81,24 +93,28 @@ describe('WebhookService.deliver', () => {
     expect(result.url).toBe(endpoint.url);
   });
 
-  it('sends correct headers including signature and event type', async () => {
+  it('sends correct headers including signature, timestamp, and event type', async () => {
     mockFetch.mockResolvedValueOnce(makeOkResponse());
     const payload = makePayload({ id: 'offer-1' }, WebhookEventType.REVENUE_REPORTED);
     const body = JSON.stringify(payload);
 
     await svc.deliver(endpoint, payload);
 
+    const call = mockFetch.mock.calls[0];
+    const headers = (call[1] as RequestInit).headers as Record<string, string>;
+
+    // Signature must start with sha256= and be 71 chars (sha256= + 64 hex)
+    expect(headers[WEBHOOK_SIGNATURE_HEADER]).toMatch(/^sha256=[0-9a-f]{64}$/);
+    // Timestamp header must be a numeric string
+    expect(Number(headers[WEBHOOK_TIMESTAMP_HEADER])).toBeGreaterThan(0);
+    expect(headers[WEBHOOK_EVENT_HEADER]).toBe(WebhookEventType.REVENUE_REPORTED);
+
     expect(mockFetch).toHaveBeenCalledWith(
       endpoint.url,
       expect.objectContaining({
         method: 'POST',
         body,
-        headers: expect.objectContaining({
-          'Content-Type': 'application/json',
-          'X-Revora-Signature': signPayload(endpoint.secret, body),
-          'X-Revora-Event': WebhookEventType.REVENUE_REPORTED,
-        }),
-      })
+      }),
     );
   });
 

@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
+import { Errors } from '../lib/errors';
 
 export interface RateLimitOptions {
   /** Maximum number of requests allowed within the window. Default: 100 */
@@ -154,12 +155,7 @@ export function createRateLimitMiddleware(options: RateLimitOptions & { store?: 
 
     if (count > limit) {
       res.setHeader('Retry-After', String(resetSecs - Math.ceil(Date.now() / 1000)));
-      res.status(429).json({
-        error: 'TooManyRequests',
-        message,
-        retryAfter: resetSecs,
-      });
-      return;
+      return next(Errors.tooManyRequests(message, { retryAfter: resetSecs }));
     }
 
     next();

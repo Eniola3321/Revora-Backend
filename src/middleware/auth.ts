@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { AuthContext, AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
 import { SessionRepository as DbSessionRepository } from '../db/repositories/sessionRepository';
 import { hashSessionToken, isSessionExpired } from '../auth/session';
-import { Errors, AppError, ErrorCode } from '../lib/errors';
+import { Errors } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
 
 // ── AuthenticatedRequest (JWT / sub-based) ────────────────────────────────────
@@ -25,12 +25,14 @@ export function authMiddleware(): RequestHandler {
     const authHeader = req.headers.authorization;
 
     if (!authHeader) {
+      globalLogger.warn('Auth failed: Authorization header missing', { path: req.path });
       next(Errors.unauthorized('Authorization header missing'));
       return;
     }
 
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') {
+      globalLogger.warn('Auth failed: Invalid auth header format', { path: req.path });
       next(Errors.unauthorized('Invalid authorization header format. Expected: Bearer <token>'));
       return;
     }
@@ -51,10 +53,11 @@ export function authMiddleware(): RequestHandler {
         next(Errors.internal('Server configuration error'));
         return;
       }
-      globalLogger.warn('JWT verification failed in authMiddleware', {
-        error: error instanceof Error ? error.message : String(error),
+      globalLogger.warn('Auth failed: JWT verification error', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        path: req.path,
       });
-      next(Errors.unauthorized('Invalid or expired token'));
+      next(Errors.unauthorized(errorMessage));
     }
   };
 }
@@ -150,26 +153,41 @@ export function verifyJwt(token: string, secretOrSecrets: string | string[]): Jw
 export function requireInvestor(req: Request, _res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    globalLogger.warn('Auth failed: Missing or invalid Bearer token for investor route', {
+      path: req.path,
+    });
     next(Errors.unauthorized('Missing or invalid Authorization header'));
     return;
   }
 
   const token = authHeader.slice(7);
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret) {
+    globalLogger.critical('Server config error: JWT_SECRET missing');
+    next(Errors.internal('Server configuration error'));
+    return;
+  }
 
   try {
     const secrets = getJwtSecretsForVerification();
     const payload = verifyJwt(token, secrets);
     if (payload.role !== 'investor') {
-      next(Errors.forbidden('investor role required'));
+      globalLogger.warn('Auth failed: Forbidden role for investor route', {
+        role: payload.role,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.forbidden('Forbidden: investor role required'));
       return;
     }
     (req as AuthenticatedRequest).user = { id: payload.sub, role: 'investor' };
     next();
   } catch (error) {
-    if (error instanceof Error && error.message.includes('JWT_SECRET')) {
-      next(Errors.internal('Server configuration error'));
-      return;
-    }
+    globalLogger.warn('Auth failed: Investor token verification failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+      path: req.path,
+    });
     next(Errors.unauthorized('Invalid or expired token'));
   }
 }
@@ -184,7 +202,8 @@ export const requireIssuerAuth = (
 ): void => {
   const issuerId = req.header('X-Issuer-Id');
   if (!issuerId) {
-    next(Errors.unauthorized('Missing Issuer ID'));
+    globalLogger.warn('Auth failed: Missing Issuer ID header', { path: req.path });
+    next(Errors.unauthorized('Unauthorized: Missing Issuer ID'));
     return;
   }
   req.user = { id: issuerId, role: 'issuer' };
@@ -196,7 +215,8 @@ export function createRequireAuth(sessionRepository: DbSessionRepository): Reque
   return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      next(Errors.unauthorized('Missing or invalid Authorization header'));
+      globalLogger.warn('Auth failed: Missing or invalid Authorization header', { path: req.path });
+      next(Errors.unauthorized('Unauthorized: Missing or invalid Authorization header'));
       return;
     }
 
@@ -207,36 +227,49 @@ export function createRequireAuth(sessionRepository: DbSessionRepository): Reque
       const claimOpts = getDefaultClaimValidationOptions();
       payload = verifyToken(token, claimOpts);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('JWT_SECRET')) {
-        next(Errors.internal('Server configuration error'));
-        return;
-      }
-      globalLogger.warn('JWT verification failed in createRequireAuth', {
-        error: err instanceof Error ? err.message : String(err),
+      globalLogger.warn('Auth failed: JWT verification error', {
+        error: err instanceof Error ? err.message : 'Unknown error',
+        path: req.path,
       });
-      next(Errors.unauthorized('Invalid or expired token'));
+      next(Errors.unauthorized('Unauthorized: invalid or expired token'));
       return;
     }
 
     if (!payload.sub || !payload.sid) {
-      next(Errors.unauthorized('Token missing subject or session'));
+      globalLogger.warn('Auth failed: Token missing sub or sid', { path: req.path });
+      next(Errors.unauthorized('Unauthorized: token missing subject or session'));
       return;
     }
 
     const session = await sessionRepository.findById(payload.sid);
 
     if (!session || session.user_id !== payload.sub) {
-      next(Errors.unauthorized('Session not found or user mismatch'));
+      globalLogger.warn('Auth failed: Session not found or user mismatch', {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.unauthorized('Unauthorized: session not found or user mismatch'));
       return;
     }
 
     if (isSessionExpired(session.expires_at)) {
-      next(Errors.unauthorized('Session expired'));
+      globalLogger.warn('Auth failed: Session expired', {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.unauthorized('Unauthorized: session expired'));
       return;
     }
 
     if (hashSessionToken(token) !== session.token_hash) {
-      next(Errors.unauthorized('Token mismatch'));
+      globalLogger.warn('Auth failed: Token hash mismatch', {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.unauthorized('Unauthorized: token mismatch'));
       return;
     }
 
