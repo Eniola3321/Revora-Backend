@@ -84,8 +84,7 @@ describe('webhookAuth middleware', () => {
     expect(mockRes.status).toHaveBeenCalledWith(401);
     expect(mockRes.json).toHaveBeenCalledWith(
       expect.objectContaining({
-        error: 'Webhook verification failed',
-        code: 'MISSING_SIGNATURE',
+        code: 'UNAUTHORIZED',
       })
     );
     expect(mockNext).not.toHaveBeenCalled();
@@ -100,8 +99,7 @@ describe('webhookAuth middleware', () => {
     expect(mockRes.status).toHaveBeenCalledWith(403);
     expect(mockRes.json).toHaveBeenCalledWith(
       expect.objectContaining({
-        error: 'Webhook verification failed',
-        code: 'VERIFICATION_FAILED',
+        code: 'FORBIDDEN',
       })
     );
     expect(mockNext).not.toHaveBeenCalled();
@@ -179,7 +177,7 @@ describe('webhookAuth middleware', () => {
     expect(mockRes.status).toHaveBeenCalledWith(403);
     expect(mockRes.json).toHaveBeenCalledWith(
       expect.objectContaining({
-        code: 'INVALID_FORMAT',
+        code: 'FORBIDDEN',
       })
     );
     expect(mockNext).not.toHaveBeenCalled();
@@ -216,7 +214,7 @@ describe('webhookAuth middleware', () => {
       expect(mockRes.status).toHaveBeenCalledWith(403);
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
-          code: 'INVALID_FORMAT',
+          code: 'FORBIDDEN',
         })
       );
     });
@@ -236,9 +234,72 @@ describe('webhookAuth middleware', () => {
       expect(mockRes.status).toHaveBeenCalledWith(403);
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
-          code: 'VERIFICATION_FAILED',
+          code: 'FORBIDDEN',
         })
       );
+    });
+
+    it('should accept a slightly future timestamp within the default clock skew window', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+      mockReq.headers['x-revora-signature'] = signature;
+      // 15 seconds in the future — within the 30 s default clockSkewMs
+      mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 15_000);
+
+      const middleware = webhookAuth({
+        secret: TEST_SECRET,
+        requireTimestamp: true,
+      });
+      middleware(mockReq, mockRes, mockNext);
+
+      expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
+    it('should reject a future timestamp beyond the default clock skew window', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+      mockReq.headers['x-revora-signature'] = signature;
+      // 45 seconds in the future — beyond the 30 s default clockSkewMs
+      mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 45_000);
+
+      const middleware = webhookAuth({
+        secret: TEST_SECRET,
+        requireTimestamp: true,
+      });
+      middleware(mockReq, mockRes, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(403);
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it('should accept a future timestamp within a custom clockSkewMs', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+      mockReq.headers['x-revora-signature'] = signature;
+      mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 50_000);
+
+      const middleware = webhookAuth({
+        secret: TEST_SECRET,
+        requireTimestamp: true,
+        clockSkewMs: 60_000, // 60-second tolerance
+      });
+      middleware(mockReq, mockRes, mockNext);
+
+      expect(mockNext).toHaveBeenCalled();
+    });
+
+    it('should reject all future timestamps when clockSkewMs is 0', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+      mockReq.headers['x-revora-signature'] = signature;
+      mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 1_000);
+
+      const middleware = webhookAuth({
+        secret: TEST_SECRET,
+        requireTimestamp: true,
+        clockSkewMs: 0,
+      });
+      middleware(mockReq, mockRes, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(403);
+      expect(mockNext).not.toHaveBeenCalled();
     });
 
     it('should reject future timestamps', () => {

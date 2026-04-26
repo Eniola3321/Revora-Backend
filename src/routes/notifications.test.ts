@@ -1,5 +1,12 @@
 import assert from 'assert';
 import { createNotificationHandlers } from './notifications';
+import { AppError } from '../lib/errors';
+
+const U1 = '550e8400-e29b-41d4-a716-446655440000';
+const U2 = '550e8400-e29b-41d4-a716-446655440001';
+const N1 = '550e8400-e29b-41d4-a716-446655440002';
+const N2 = '550e8400-e29b-41d4-a716-446655440003';
+const N3 = '550e8400-e29b-41d4-a716-446655440004';
 
 // Mock notification repo
 class MockNotificationRepo {
@@ -43,46 +50,99 @@ function makeRes() {
 }
 
 describe('notifications routes', () => {
-  it('covers listing, mark read, bulk mark, and auth failures', async () => {
-  const rows = [
-    { id: 'n1', user_id: 'u1', message: 'm1', read: false, type: 'info', created_at: new Date() },
-    { id: 'n2', user_id: 'u1', message: 'm2', read: false, type: 'alert', created_at: new Date() },
-    { id: 'n3', user_id: 'u2', message: 'm3', read: false, type: 'info', created_at: new Date() },
-  ];
+  let repo: MockNotificationRepo;
+  let handlers: any;
 
-  const repo = new MockNotificationRepo(rows);
-  const handlers = createNotificationHandlers(repo as any);
+  beforeEach(() => {
+    const rows = [
+      { id: N1, user_id: U1, message: 'm1', read: false, type: 'info', created_at: new Date() },
+      { id: N2, user_id: U1, message: 'm2', read: false, type: 'alert', created_at: new Date() },
+      { id: N3, user_id: U2, message: 'm3', read: false, type: 'info', created_at: new Date() },
+    ];
+    repo = new MockNotificationRepo(rows);
+    handlers = createNotificationHandlers(repo as any);
+  });
 
-  // GET notifications
-  const req1 = makeReq({ id: 'u1' });
-  const res1 = makeRes();
-  await handlers.getNotifications(req1, res1, (e: any) => { throw e; });
-  const out1 = res1._get();
-  assert(out1.statusCode === 200);
-  assert(out1.jsonData.notifications.length === 2, 'expected 2 notifications for u1');
+  it('lists notifications for user', async () => {
+    const req = makeReq({ id: U1 });
+    const res = makeRes();
+    await handlers.getNotifications(req, res, (e: any) => { throw e; });
+    
+    const { statusCode, jsonData } = res._get();
+    assert.strictEqual(statusCode, 200);
+    assert.strictEqual(jsonData.notifications.length, 2);
+  });
 
-  // PATCH single
-  const req2 = makeReq({ id: 'u1' }, { id: 'n1' }, {});
-  const res2 = makeRes();
-  await handlers.markRead(req2, res2, (e: any) => { throw e; });
-  const out2 = res2._get();
-  assert(out2.statusCode === 200);
-  assert(out2.jsonData.marked === 1);
-  assert(repo.notifications.find((n) => n.id === 'n1')!.read === true);
+  it('marks single notification as read', async () => {
+    const req = makeReq({ id: U1 }, { id: N1 });
+    const res = makeRes();
+    await handlers.markRead(req, res, (e: any) => { throw e; });
+    
+    const { statusCode, jsonData } = res._get();
+    assert.strictEqual(statusCode, 200);
+    assert.strictEqual(jsonData.marked, 1);
+    assert.strictEqual(repo.notifications.find(n => n.id === N1).read, true);
+  });
 
-  // PATCH bulk
-  const req3 = makeReq({ id: 'u1' }, {}, { ids: ['n2'] });
-  const res3 = makeRes();
-  await handlers.markRead(req3, res3, (e: any) => { throw e; });
-  const out3 = res3._get();
-  assert(out3.statusCode === 200);
-  assert(out3.jsonData.marked === 1);
+  it('marks multiple notifications as read (bulk via path)', async () => {
+    const req = makeReq({ id: U1 }, { id: 'bulk' }, { ids: [N1, N2] });
+    const res = makeRes();
+    await handlers.markRead(req, res, (e: any) => { throw e; });
+    
+    const { statusCode, jsonData } = res._get();
+    assert.strictEqual(statusCode, 200);
+    assert.strictEqual(jsonData.marked, 2);
+  });
 
-  // Unauthorized
-  const req4 = makeReq(null);
-  const res4 = makeRes();
-  await handlers.getNotifications(req4, res4, (e: any) => { throw e; });
-  const out4 = res4._get();
-  assert(out4.statusCode === 401);
+  it('returns 401 when unauthorized', async () => {
+    const req = makeReq(null);
+    const res = makeRes();
+    let capturedError: any;
+    await handlers.getNotifications(req, res, (e: any) => { capturedError = e; });
+    
+    assert(capturedError instanceof AppError);
+    assert.strictEqual(capturedError.statusCode, 401);
+  });
+
+  it('returns 404 when notification not found or belongs to another user', async () => {
+    const req = makeReq({ id: U1 }, { id: N3 }); // N3 belongs to U2
+    const res = makeRes();
+    let capturedError: any;
+    await handlers.markRead(req, res, (e: any) => { capturedError = e; });
+    
+    assert(capturedError instanceof AppError);
+    assert.strictEqual(capturedError.statusCode, 404);
+  });
+
+  it('returns 400 for invalid UUID in params', async () => {
+    const req = makeReq({ id: U1 }, { id: 'invalid-uuid' });
+    const res = makeRes();
+    let capturedError: any;
+    await handlers.markRead(req, res, (e: any) => { capturedError = e; });
+    
+    assert(capturedError instanceof AppError);
+    assert.strictEqual(capturedError.statusCode, 400);
+    assert.strictEqual(capturedError.code, 'VALIDATION_ERROR');
+  });
+
+  it('returns 400 for invalid UUID in bulk body', async () => {
+    const req = makeReq({ id: U1 }, { id: 'bulk' }, { ids: ['invalid-uuid'] });
+    const res = makeRes();
+    let capturedError: any;
+    await handlers.markRead(req, res, (e: any) => { capturedError = e; });
+    
+    assert(capturedError instanceof AppError);
+    assert.strictEqual(capturedError.statusCode, 400);
+    assert.strictEqual(capturedError.code, 'VALIDATION_ERROR');
+  });
+
+  it('returns 400 when bulk path used without ids in body', async () => {
+    const req = makeReq({ id: U1 }, { id: 'bulk' }, { ids: [] });
+    const res = makeRes();
+    let capturedError: any;
+    await handlers.markRead(req, res, (e: any) => { capturedError = e; });
+    
+    assert(capturedError instanceof AppError);
+    assert.strictEqual(capturedError.statusCode, 400);
   });
 });

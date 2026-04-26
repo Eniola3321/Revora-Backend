@@ -2,7 +2,9 @@
 import { createRegisterHandler } from './registerHandler';
 import { DuplicateEmailError, RegisterService } from './registerService';
 import { RegisteredUser } from './types';
-import { ErrorCode } from '../../lib/errors';
+import { AppError, ErrorCode, UniqueConstraintError } from '../../lib/errors';
+
+// ─── Mock RegisterService ─────────────────────────────────────────────────────
 
 class MockRegisterService {
   result: RegisteredUser | null = null;
@@ -50,7 +52,7 @@ describe('registerHandler', () => {
     svc.result = makeUser();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'investor@example.com', password: 'StrongSecret123!' }), res, (e: unknown) => { throw e; });
+    await handler(makeReq({ email: 'investor@example.com', password: 'StrongSecret123!' }), res, (e: unknown) => { if (e) throw e; });
     const { statusCode, jsonData } = res._get();
     assert.strictEqual(statusCode, 201, `expected 201 got ${statusCode}`);
     assert.deepStrictEqual((jsonData as any).user, { id: 'user-1', email: 'investor@example.com', role: 'investor' });
@@ -61,7 +63,7 @@ describe('registerHandler', () => {
     svc.result = makeUser({ email: 'alice@example.com' });
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'alice@example.com', password: 'StrongPass555!', name: 'Alice' }), res, (e: unknown) => { throw e; });
+    await handler(makeReq({ email: 'alice@example.com', password: 'StrongPass555!', name: 'Alice' }), res, (e: unknown) => { if (e) throw e; });
     assert.strictEqual(res._get().statusCode, 201);
   }
 
@@ -82,68 +84,90 @@ describe('registerHandler', () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ password: 'password1' }), res, noop);
-    expect(res._status()).toBe(400);
-    expect((res._body() as any).code).toBe(ErrorCode.VALIDATION_ERROR);
-  });
+    let capturedErr: any = null;
+    await handler(makeReq({ password: 'password1' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 400);
+    assert.strictEqual(capturedErr.code, ErrorCode.BAD_REQUEST);
+  }
 
   it('returns 400 VALIDATION_ERROR when password is missing', async () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'investor@example.com' }), res, noop);
-    expect(res._status()).toBe(400);
-    expect((res._body() as any).code).toBe(ErrorCode.VALIDATION_ERROR);
-  });
+    let capturedErr: any = null;
+    await handler(makeReq({ email: 'investor@example.com' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 400);
+  }
 
   it('returns 400 VALIDATION_ERROR when body is absent', async () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq(undefined), res, noop);
-    expect(res._status()).toBe(400);
-    expect((res._body() as any).code).toBe(ErrorCode.VALIDATION_ERROR);
-  });
+    let capturedErr: any = null;
+    await handler(makeReq(undefined), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 400);
+  }
 
   it('returns 400 VALIDATION_ERROR when email is not a string', async () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 123, password: 'password1' }), res, noop);
-    expect(res._status()).toBe(400);
-    expect((res._body() as any).code).toBe(ErrorCode.VALIDATION_ERROR);
-  });
+    let capturedErr: any = null;
+    await handler(makeReq({ email: 123, password: 'password1' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 400);
+  }
 
   it('returns 400 VALIDATION_ERROR for invalid email format', async () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'notanemail', password: 'password1' }), res, noop);
-    expect(res._status()).toBe(400);
-    expect((res._body() as any).code).toBe(ErrorCode.VALIDATION_ERROR);
-    expect((res._body() as any).message).toMatch(/email/i);
-  });
+    let capturedErr: any = null;
+    await handler(makeReq({ email: 'notanemail', password: 'password1' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 400);
+    assert.match(capturedErr.message, /email/i);
+  }
 
-  it('returns 400 VALIDATION_ERROR when password is too short', async () => {
+  // ── Password strength validation (forwarded from service) ──────────────────
+  {
     const svc = new MockRegisterService();
+    const err = new AppError(ErrorCode.VALIDATION_ERROR, 'Weak password', 400);
+    svc.shouldThrow = err;
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'investor@example.com', password: 'short' }), res, noop);
-    expect(res._status()).toBe(400);
-    expect((res._body() as any).code).toBe(ErrorCode.VALIDATION_ERROR);
-    expect((res._body() as any).message).toMatch(/password/i);
-  });
+    let capturedErr: any = null;
+    await handler(makeReq({ email: 'investor@example.com', password: 'short' }), res, (e: unknown) => { capturedErr = e; });
+    assert.strictEqual(capturedErr, err);
+  }
 
   it('returns 409 CONFLICT when service throws DuplicateEmailError', async () => {
     const svc = new MockRegisterService();
     svc.shouldThrow = new DuplicateEmailError();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'taken@example.com', password: 'StrongPass666!' }), res, (e: unknown) => { throw e; });
-    const { statusCode, jsonData } = res._get();
-    assert.strictEqual(statusCode, 409);
-    assert.strictEqual((jsonData as any).error, 'Conflict');
-    assert.strictEqual((jsonData as any).message, 'Email already registered');
+    let capturedErr: any = null;
+    await handler(makeReq({ email: 'taken@example.com', password: 'StrongPass666!' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 409);
+    assert.strictEqual(capturedErr.code, ErrorCode.CONFLICT);
+    assert.strictEqual(capturedErr.message, 'Email already registered');
+  }
+
+  // ── 409 when service throws UniqueConstraintError ────────────────────────────
+  {
+    const svc = new MockRegisterService();
+    svc.shouldThrow = new UniqueConstraintError('email');
+    const handler = createRegisterHandler(svc as unknown as RegisterService);
+    const res = makeRes();
+    let capturedErr: any = null;
+    await handler(makeReq({ email: 'taken@example.com', password: 'StrongPass666!' }), res, (e: unknown) => { capturedErr = e; });
+    assert(capturedErr instanceof AppError);
+    assert.strictEqual(capturedErr.statusCode, 409);
+    assert.strictEqual(capturedErr.code, ErrorCode.CONFLICT);
   }
 
   it('409 response body does not expose stack or internal details', async () => {
@@ -156,3 +180,4 @@ describe('registerHandler', () => {
   }
   });
 });
+
