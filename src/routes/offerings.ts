@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
-
+import { Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 export interface Offering {
   id: string;
   issuer_id: string;
@@ -36,9 +37,15 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
   async function listOfferings(req: Request, res: Response, next: NextFunction) {
     try {
       const user = (req as any).user;
-      if (!user || !user.id) return res.status(401).json({ error: 'Unauthorized' });
+      if (!user || !user.id) {
+        globalLogger.warn('Unauthorized access attempt to offerings list');
+        return next(Errors.unauthorized());
+      }
       // Only startups allowed; optional role check
-      if (user.role && user.role !== 'startup') return res.status(403).json({ error: 'Forbidden' });
+      if (user.role && user.role !== 'startup') {
+        globalLogger.warn('Forbidden access attempt to offerings list', { userId: user.id, role: user.role });
+        return next(Errors.forbidden());
+      }
 
       const status = typeof req.query.status === 'string' ? req.query.status : undefined;
       const limit = req.query.limit ? Math.max(0, parseInt(String(req.query.limit), 10) || 0) : undefined;
@@ -68,7 +75,8 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
       const sort = typeof req.query.sort === 'string' ? req.query.sort : undefined;
 
       if (typeof offeringRepo.listPublic !== 'function') {
-        throw new Error('offeringRepo.listPublic not implemented');
+        globalLogger.error('offeringRepo.listPublic not implemented');
+        return next(Errors.internal('Internal server error'));
       }
 
       const offerings = await offeringRepo.listPublic({ status, limit, offset, sort });
@@ -86,12 +94,14 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
     try {
       const { id } = req.params;
       if (!isValidUuid(id)) {
-        return res.status(400).json({ error: 'Invalid offering id format' });
+        globalLogger.warn('Invalid offering id format requested', { id });
+        return next(Errors.badRequest('Invalid offering id format'));
       }
 
       const offering = await offeringRepo.getById(id);
       if (!offering) {
-        return res.status(404).json({ error: 'Offering not found' });
+        globalLogger.warn('Offering not found', { id });
+        return next(Errors.notFound('Offering not found'));
       }
 
       const user = (req as any).user;

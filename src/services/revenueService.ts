@@ -4,6 +4,8 @@ import {
     CreateRevenueReportInput,
     RevenueReport,
 } from '../db/repositories/revenueReportRepository';
+import { Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 export interface SubmitRevenueReportInput {
     offeringId: string;
@@ -40,27 +42,27 @@ export class RevenueService {
         // 1. Validate offering existence and ownership
         const offering = await this.offeringRepo.findById(input.offeringId);
         if (!offering) {
-            throw new Error(`Offering ${input.offeringId} not found`);
+            throw Errors.notFound(`Offering ${input.offeringId} not found`);
         }
 
         if (offering.issuer_id !== input.issuerId) {
-            throw new Error(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
+            throw Errors.forbidden(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
         }
 
         // 2. Validate amount format and value
         const amountRegex = /^\d+(\.\d{1,10})?$/;
         if (!amountRegex.test(input.amount)) {
-            throw new Error('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
+            throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
         }
 
         const amountNum = parseFloat(input.amount);
         if (amountNum <= 0) {
-            throw new Error('Invalid revenue amount: must be greater than zero');
+            throw Errors.validationError('Invalid revenue amount: must be greater than zero');
         }
 
         // 3. Validate period logic
         if (input.periodEnd <= input.periodStart) {
-            throw new Error('Invalid period: end date must be strictly after start date');
+            throw Errors.validationError('Invalid period: end date must be strictly after start date');
         }
 
         // 4. Enforce non-overlapping periods per offering
@@ -71,7 +73,7 @@ export class RevenueService {
         );
 
         if (overlapping) {
-            throw new Error(
+            throw Errors.conflict(
                 `A revenue report already exists that overlaps with the specified period (${input.periodStart.toISOString()} - ${input.periodEnd.toISOString()})`
             );
         }
@@ -95,9 +97,12 @@ export class RevenueService {
     private emitDistributionEvent(report: RevenueReport) {
         // Placeholder for event emission logic
         // This could be a message to a queue (e.g., RabbitMQ, Kafka) or a PubSub system
-        // eslint-disable-next-line no-console
-        console.log(
-            `[Event] Revenue report submitted: ${report.id} for offering ${report.offering_id}. Triggering distribution engine...`
-        );
+        globalLogger.info(`Revenue report submitted for offering ${report.offering_id}. Triggering distribution engine...`, {
+            reportId: report.id,
+            offeringId: report.offering_id,
+            amount: report.amount,
+            periodStart: report.period_start,
+            periodEnd: report.period_end,
+        });
     }
 }

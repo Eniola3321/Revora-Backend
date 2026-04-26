@@ -10,6 +10,7 @@ export const ErrorCode = {
   CONFLICT: 'CONFLICT',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  TOO_MANY_REQUESTS: 'TOO_MANY_REQUESTS',
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -129,6 +130,9 @@ export const Errors = {
       { expose: false },
     );
   },
+
+  tooManyRequests: (message = 'Too many requests', details?: unknown): AppError =>
+    createError(ErrorCode.TOO_MANY_REQUESTS, message, 429, details),
 };
 
 export function throwError(

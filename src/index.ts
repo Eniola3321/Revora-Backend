@@ -8,7 +8,7 @@ import { requestIdMiddleware } from './middleware/requestId';
 import { Errors } from './lib/errors';
 import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellarRpcFailure';
 import { createHealthRouter } from './routes/health';
-import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
+import vestingRouter from './routes/vesting';
 
 const port = process.env.PORT ?? 3000;
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? '/api/v1';
@@ -578,6 +578,8 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     offeringSanitizeMiddleware,
     createOfferingValidationHandler(),
   );
+
+  apiRouter.use('/vesting', vestingRouter);
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound('Route not found')));
