@@ -4,6 +4,8 @@ import {
     CreateRevenueReportInput,
     RevenueReport,
 } from '../db/repositories/revenueReportRepository';
+import { Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 export interface SubmitRevenueReportInput {
     offeringId: string;
@@ -40,27 +42,27 @@ export class RevenueService {
         // 1. Validate offering existence and ownership
         const offering = await this.offeringRepo.findById(input.offeringId);
         if (!offering) {
-            throw new Error(`Offering ${input.offeringId} not found`);
+            throw Errors.notFound(`Offering ${input.offeringId} not found`);
         }
 
         if (offering.issuer_id !== input.issuerId) {
-            throw new Error(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
+            throw Errors.forbidden(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
         }
 
         // 2. Validate amount format and value
         const amountRegex = /^\d+(\.\d{1,10})?$/;
         if (!amountRegex.test(input.amount)) {
-            throw new Error('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
+            throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
         }
 
         const amountNum = parseFloat(input.amount);
         if (amountNum <= 0) {
-            throw new Error('Invalid revenue amount: must be greater than zero');
+            throw Errors.validationError('Invalid revenue amount: must be greater than zero');
         }
 
         // 3. Validate period logic
         if (input.periodEnd <= input.periodStart) {
-            throw new Error('Invalid period: end date must be strictly after start date');
+            throw Errors.validationError('Invalid period: end date must be strictly after start date');
         }
 
         // 4. Enforce non-overlapping periods per offering
@@ -69,9 +71,73 @@ export class RevenueService {
             input.periodStart,
             input.periodEnd
         );
+      }
+    } catch (error) {
+      this.logger.warn('Invalid revenue amount format', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        `Invalid revenue amount: ${amount}`,
+        400,
+        { field: 'amount', value: amount }
+      );
+    }
+
+    // 2. Validate period dates
+    const startDate = new Date(periodStart);
+    const endDate = new Date(periodEnd);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        'Invalid date format for periodStart or periodEnd. Must be ISO 8601.',
+        400,
+        { periodStart, periodEnd }
+      );
+    }
+
+    if (startDate >= endDate) {
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        'periodEnd must be after periodStart.',
+        400,
+        { periodStart, periodEnd }
+      );
+    }
+
+    // 3. Convert amount to Soroban i128 scaled BigInt
+    let amountI128: BigInt;
+    try {
+      amountI128 = decimalAmount.toSorobanI128(SOROBAN_I128_SCALE);
+    } catch (error) {
+      this.logger.error('Failed to convert decimal amount to Soroban i128', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        ErrorCode.INTERNAL_ERROR,
+        'Failed to process revenue amount for Soroban.',
+        500,
+        { offeringId, amount }
+      );
+    }
+
+    // 4. Submit to Stellar/Soroban
+    let transactionId: string;
+    try {
+      transactionId = await this.stellarService.submitRevenueToSoroban(
+        offeringId,
+        amountI128,
+        startDate,
+        endDate
+      );
+      this.logger.info('Revenue submitted to Soroban', { offeringId, amount, amountI128: amountI128.toString(), transactionId });
+    } catch (error) {
+      this.logger.error('Stellar RPC submission failed', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      // Use a utility to classify Stellar RPC failures into AppErrors
+      throw this.classifyStellarRPCFailure(error);
+    }
 
         if (overlapping) {
-            throw new Error(
+            throw Errors.conflict(
                 `A revenue report already exists that overlaps with the specified period (${input.periodStart.toISOString()} - ${input.periodEnd.toISOString()})`
             );
         }
@@ -95,9 +161,21 @@ export class RevenueService {
     private emitDistributionEvent(report: RevenueReport) {
         // Placeholder for event emission logic
         // This could be a message to a queue (e.g., RabbitMQ, Kafka) or a PubSub system
-        // eslint-disable-next-line no-console
-        console.log(
-            `[Event] Revenue report submitted: ${report.id} for offering ${report.offering_id}. Triggering distribution engine...`
-        );
+        globalLogger.info(`Revenue report submitted for offering ${report.offering_id}. Triggering distribution engine...`, {
+            reportId: report.id,
+            offeringId: report.offering_id,
+            amount: report.amount,
+            periodStart: report.period_start,
+            periodEnd: report.period_end,
+        });
     }
+
+    // Generic fallback for unclassified errors
+    this.logger.error('Unclassified Stellar RPC error', { error });
+    return new AppError(
+      ErrorCode.INTERNAL_ERROR,
+      'An unexpected error occurred while interacting with the Stellar network.',
+      500
+    );
+  }
 }

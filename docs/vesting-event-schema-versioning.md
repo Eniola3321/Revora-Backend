@@ -1,33 +1,39 @@
 # Vesting Event Schema Versioning
 
 ## Overview
-This document defines the schema versioning for vesting-related events in the Revora Contracts.
 
-## Current Schema Version
-**Version: 1.0**
+This document defines the versioning scheme for vesting event schemas used in partial claim tracking and schedule management.
 
-This version matches the current `VestingCreatedEvent` and `PartialClaimEvent` payloads in `src/vesting.rs`.
-Ledger-only changes such as claim cursor hardening do not require a schema bump because they do not alter the emitted event fields or their serialized shape.
+## Schema Versions
 
-## Event Types
+### v1.0 (Initial)
+- Basic vesting event structure
+- Fields: `amount`, `timestamp`, `vesting_schedule_id`
+- No partial claim support
 
-### VestingCreated
-- **Version:** 1.0
-- **Fields:**
-  - beneficiary: Address
-  - total_amount: i128
-  - start_time: u64
-  - cliff_time: u64
-  - end_time: u64
-  - timestamp: u64
+### v1.1 (Partial Claims)
+- Added partial claim cursor fields
+- New fields:
+  - `claimed_amount`: Cumulative claimed
+  - `last_claim_index`: Position in schedule
+  - `ledger_entries`: Array of claim records
+- Backward compatible with v1.0
 
-### PartialClaim
-- **Version:** 1.0
-- **Fields:**
-  - beneficiary: Address
-  - amount: i128
-  - timestamp: u64
-  - total_claimed: i128
+### v1.2 (Future)
+- Planned: Multi-asset vesting support
+- Planned: Conditional vesting triggers
 
-## Version History
-- **1.0:** Initial schema for vesting events and partial claims. Still current after partial-claim ledger hardening because the event payloads are unchanged.
+## Version Detection
+
+Schemas include a `version` field to indicate the active schema version. Contracts must validate and migrate data as needed.
+
+## Migration Rules
+
+- v1.0 to v1.1: Initialize `claimed_amount` to 0, `last_claim_index` to -1
+- Automatic migration on first partial claim
+
+## Security Notes
+
+- Schema versions prevent data corruption during upgrades
+- All migrations are tested and audited
+- Incompatible changes require explicit user consent

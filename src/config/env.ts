@@ -33,6 +33,10 @@ function normalizeStellarNetwork(value?: string): "testnet" | "public" {
 
 function parseAllowedOrigins(value?: string): string[] {
   if (!value) {
+    // In production, require explicit configuration
+    if (process.env.NODE_ENV === 'production') {
+      return [];
+    }
     // Default to localhost in development
     return ["http://localhost:3000"];
   }

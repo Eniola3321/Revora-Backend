@@ -79,8 +79,7 @@ describe('requireAuth middleware', () => {
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
   });
 
   it('returns 401 when the header is not Bearer scheme', async () => {
@@ -89,8 +88,7 @@ describe('requireAuth middleware', () => {
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
   });
 
   it('returns 401 for an invalid/tampered token', async () => {
@@ -99,8 +97,7 @@ describe('requireAuth middleware', () => {
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
   });
 
   it('returns 401 for an expired token', async () => {
@@ -110,8 +107,7 @@ describe('requireAuth middleware', () => {
 
     await requireAuth(req as Request, res, mockNext);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(mockNext).not.toHaveBeenCalled();
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
   });
 });
 
@@ -153,12 +149,10 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({
-        error: 'Unauthorized',
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({
+        statusCode: 401,
         message: 'Authorization header missing',
-      });
-      expect(next).not.toHaveBeenCalled();
+      }));
     });
   });
 
@@ -170,8 +164,7 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
     });
 
     it('returns 401 with malformed token', () => {
@@ -181,8 +174,7 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
     });
 
     it('returns 401 with wrong secret', () => {
@@ -197,8 +189,7 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
     });
   });
 
@@ -211,8 +202,7 @@ describe('authMiddleware', () => {
 
       authMiddleware()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(401);
-      expect(next).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
     });
   });
 });
@@ -278,8 +268,10 @@ describe('requireInvestor', () => {
 
     requireInvestor(makeReq(), res, next);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 401,
+      message: 'Missing or invalid Authorization header',
+    }));
   });
 
   it('returns 401 for Basic auth', () => {
@@ -288,8 +280,10 @@ describe('requireInvestor', () => {
 
     requireInvestor(makeReq('Basic some-credentials'), res, next);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 401,
+      message: 'Missing or invalid Authorization header',
+    }));
   });
 
   it('returns 401 for an invalid token', () => {
@@ -298,8 +292,10 @@ describe('requireInvestor', () => {
 
     requireInvestor(makeReq('Bearer invalid.token.here'), res, next);
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 401,
+      message: 'Invalid or expired token',
+    }));
   });
 
   it('returns 403 for a non-investor role', () => {
@@ -309,8 +305,10 @@ describe('requireInvestor', () => {
 
     requireInvestor(makeReq(`Bearer ${token}`), res, next);
 
-    expect(res.status).toHaveBeenCalledWith(403);
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 403,
+      message: 'Forbidden: investor role required',
+    }));
   });
 
   it('returns 500 when JWT_SECRET is not set', () => {
@@ -321,7 +319,9 @@ describe('requireInvestor', () => {
 
     requireInvestor(makeReq(`Bearer ${token}`), res, next);
 
-    expect(res.status).toHaveBeenCalledWith(500);
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({
+      statusCode: 500,
+      message: 'Server configuration error',
+    }));
   });
 });
