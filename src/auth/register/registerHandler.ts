@@ -48,6 +48,17 @@ export const createRegisterHandler = (
 
       const user = await registerService.register(email, password);
 
+      // Structured log for successful registration (no PII in production logs)
+      console.info(
+        JSON.stringify({
+          type: 'auth',
+          event: 'STARTUP_REGISTER_SUCCESS',
+          userId: user.id,
+          role: user.role,
+          timestamp: new Date().toISOString(),
+        }),
+      );
+
       res.status(201).json({
         user: { id: user.id, email: user.email, role: user.role },
       });
