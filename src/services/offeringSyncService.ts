@@ -1,21 +1,24 @@
-import { OfferingRepository, Offering, UpdateOfferingStateInput } from '../db/repositories/offeringRepository';
+import {
+  OfferingRepository,
+  Offering,
+  UpdateOfferingStateInput,
+} from '../db/repositories/offeringRepository';
+import {
+  canTransition,
+  normalizeOfferingStatus,
+} from '../lib/offeringStatusGuard';
+import {
+  classifyStellarRPCFailure,
+  StellarRPCFailureClass,
+} from '../lib/stellarRpcFailure';
 import { Logger, globalLogger } from '../lib/logger';
-import { AppError, Errors } from '../lib/errors';
-import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
-import { HorizonClient, StellarAccount } from '../lib/stellar';
 
-/**
- * On-chain offering state returned by Soroban/Stellar contract
- */
 export interface OnChainOfferingState {
   status: 'draft' | 'active' | 'closed' | 'completed';
   total_raised: string;
   last_updated_ledger?: number;
 }
 
-/**
- * Stellar/Soroban client interface with Horizon and RPC capabilities
- */
 export interface StellarClient {
   getOfferingState(contractAddress: string): Promise<OnChainOfferingState>;
   getAccountInfo(publicKey: string): Promise<StellarAccount>;
@@ -111,76 +114,27 @@ export class RealStellarClient implements StellarClient {
   }
 }
 
-/**
- * Result of a single offering sync
- */
 export interface SyncResult {
   offeringId: string;
   contractAddress: string;
   success: boolean;
   updated: boolean;
+  offering?: Offering;
   error?: string;
   failureClass?: StellarRPCFailureClass;
-  duration?: number;
 }
 
-/**
- * Configuration for stale catalog recovery
- */
-export interface StaleCatalogConfig {
-  /** Age in hours after which catalog is considered stale */
-  staleThresholdHours: number;
-  /** Maximum number of offerings to process in one batch */
-  batchSize: number;
-  /** Whether to automatically update stale offerings */
-  autoUpdate: boolean;
-}
-
-/**
- * Result of stale catalog recovery
- */
-export interface StaleCatalogResult {
-  totalProcessed: number;
-  staleFound: number;
-  updated: number;
-  failed: number;
-  errors: Array<{
-    offeringId: string;
-    error: string;
-    failureClass: StellarRPCFailureClass;
-  }>;
-  duration: number;
-}
-
-/**
- * Offering Sync Service
- * Reads offering state from the Soroban contract and updates the local DB.
- * Integrates with Stellar Horizon for account data and Soroban RPC for contract state.
- * Includes stale catalog recovery and comprehensive error handling.
- */
 export class OfferingSyncService {
-  private logger: Logger;
-  private staleConfig: StaleCatalogConfig;
+  private readonly logger: Logger;
 
   constructor(
-    private offeringRepository: OfferingRepository,
-    private stellarClient: StellarClient,
-    config: { logger?: Logger; staleConfig?: Partial<StaleCatalogConfig> } = {}
+    private readonly offeringRepository: OfferingRepository,
+    private readonly stellarClient: StellarClient,
+    logger: Logger = globalLogger,
   ) {
-    this.logger = config.logger || globalLogger.child({ component: 'OfferingSyncService' });
-    this.staleConfig = {
-      staleThresholdHours: 24,
-      batchSize: 50,
-      autoUpdate: true,
-      ...config.staleConfig,
-    };
+    this.logger = logger.child({ module: 'OfferingSyncService' });
   }
 
-  /**
-   * Sync a single offering by ID
-   * @param offeringId The local offering ID
-   * @returns SyncResult
-   */
   async syncOffering(offeringId: string): Promise<SyncResult> {
     const startTime = Date.now();
     this.logger.info('Starting offering sync', { offeringId });
@@ -207,9 +161,7 @@ export class OfferingSyncService {
         contractAddress: '',
         success: false,
         updated: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        failureClass: classifyStellarRPCFailure(error),
-        duration: Date.now() - startTime,
+        error: 'Offering not found',
       };
       this.logger.error('Failed to sync offering', {
         offeringId,
@@ -218,90 +170,75 @@ export class OfferingSyncService {
       });
       return result;
     }
+
+    return this.syncOfferingRecord(offering);
   }
 
-  /**
-   * Sync all offerings in the DB against the chain
-   * @returns Array of SyncResults
-   */
-  async syncAll(): Promise<SyncResult[]> {
-    const startTime = Date.now();
-    this.logger.info('Starting full catalog sync');
-
-    try {
-      const offerings = await this.offeringRepository.listAll();
-      this.logger.info('Found offerings for sync', { count: offerings.length });
-
-      const results = await Promise.allSettled(
-        offerings.map((o) => this.syncFromChain(o, Date.now()))
-      );
-
-      const syncResults = results.map((r, i) => {
-        if (r.status === 'fulfilled') return r.value;
-        
-        const error = r.reason;
-        return {
-          offeringId: offerings[i].id,
-          contractAddress: offerings[i].contract_address ?? '',
-          success: false,
-          updated: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
-          failureClass: classifyStellarRPCFailure(error),
-          duration: 0,
-        };
-      });
-
-      const successful = syncResults.filter(r => r.success).length;
-      const failed = syncResults.filter(r => !r.success).length;
-      const updated = syncResults.filter(r => r.updated).length;
-
-      this.logger.info('Full catalog sync completed', {
-        total: syncResults.length,
-        successful,
-        failed,
-        updated,
-        duration: Date.now() - startTime,
-      });
-
-      return syncResults;
-    } catch (error) {
-      this.logger.error('Failed to start full catalog sync', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Core sync logic: read from chain, compare, update DB if changed
-   */
-  private async syncFromChain(offering: Offering, syncStartTime: number): Promise<SyncResult> {
-    const operationStartTime = Date.now();
-    
+  async syncOfferingRecord(offering: Offering): Promise<SyncResult> {
     try {
       if (!offering.contract_address) {
-        const result: SyncResult = {
+        this.logger.warn('Skipping offering sync without contract address', {
+          offeringId: offering.id,
+        });
+
+        return {
           offeringId: offering.id,
           contractAddress: '',
           success: false,
           updated: false,
-          error: `Offering ${offering.id} does not have a contract_address configured`,
-          duration: Date.now() - syncStartTime,
+          offering,
+          error: 'Offering is not configured for on-chain sync',
         };
         this.logger.warn('Offering missing contract address', { offeringId: offering.id });
         return result;
       }
 
       const contractAddress = offering.contract_address;
-      this.logger.debug('Syncing offering from chain', {
-        offeringId: offering.id,
-        contractAddress,
-      });
-
       const onChain = await this.stellarClient.getOfferingState(contractAddress);
 
+      const normalizedLocalStatus = normalizeOfferingStatus(offering.status);
+      const normalizedChainStatus = normalizeOnChainStatus(onChain.status);
+
+      if (!normalizedChainStatus) {
+        this.logger.error('Received unsupported on-chain offering status', {
+          offeringId: offering.id,
+          contractAddress,
+          chainStatus: onChain.status,
+        });
+
+        return {
+          offeringId: offering.id,
+          contractAddress,
+          success: false,
+          updated: false,
+          offering,
+          error: 'On-chain offering state is invalid',
+        };
+      }
+
+      if (
+        normalizedLocalStatus &&
+        !canTransition(normalizedLocalStatus, normalizedChainStatus)
+      ) {
+        this.logger.warn('Rejected incompatible on-chain offering transition', {
+          offeringId: offering.id,
+          contractAddress,
+          currentStatus: normalizedLocalStatus,
+          chainStatus: normalizedChainStatus,
+        });
+
+        return {
+          offeringId: offering.id,
+          contractAddress,
+          success: false,
+          updated: false,
+          offering,
+          error: 'On-chain status is not compatible with catalog state',
+        };
+      }
+
       const hasChanged =
-        onChain.status !== offering.status ||
+        normalizedChainStatus !== normalizedLocalStatus ||
         onChain.total_raised !== offering.total_raised;
 
       if (!hasChanged) {
@@ -310,7 +247,11 @@ export class OfferingSyncService {
           contractAddress,
           success: true,
           updated: false,
-          duration: Date.now() - syncStartTime,
+          offering: {
+            ...offering,
+            status: normalizedChainStatus,
+            total_raised: onChain.total_raised,
+          },
         };
         this.logger.debug('Offering state unchanged', {
           offeringId: offering.id,
@@ -320,40 +261,49 @@ export class OfferingSyncService {
       }
 
       const update: UpdateOfferingStateInput = {
-        status: onChain.status,
+        status: normalizedChainStatus,
         total_raised: onChain.total_raised,
       };
 
-      await this.offeringRepository.updateState(offering.id, update);
+      const updatedOffering =
+        (await this.offeringRepository.updateState(offering.id, update)) ?? {
+          ...offering,
+          ...update,
+        };
+
+      this.logger.info('Offering catalog synchronized with on-chain state', {
+        offeringId: offering.id,
+        contractAddress,
+        previousStatus: normalizedLocalStatus ?? null,
+        nextStatus: normalizedChainStatus,
+        totalRaised: onChain.total_raised,
+      });
 
       const result: SyncResult = {
         offeringId: offering.id,
         contractAddress,
         success: true,
         updated: true,
-        duration: Date.now() - syncStartTime,
+        offering: updatedOffering,
       };
+    } catch (error) {
+      const failureClass = classifyStellarRPCFailure(error);
 
-      this.logger.info('Offering updated from chain', {
+      this.logger.error('Offering sync failed against Stellar dependency', {
         offeringId: offering.id,
-        contractAddress,
-        oldStatus: offering.status,
-        newStatus: onChain.status,
-        oldTotalRaised: offering.total_raised,
-        newTotalRaised: onChain.total_raised,
-        duration: result.duration,
+        contractAddress: offering.contract_address ?? '',
+        failureClass,
+        error,
       });
 
-      return result;
-    } catch (err: any) {
-      const result: SyncResult = {
+      return {
         offeringId: offering.id,
         contractAddress: offering.contract_address ?? '',
         success: false,
         updated: false,
-        error: err.message ?? 'Unknown error',
-        failureClass: classifyStellarRPCFailure(err),
-        duration: Date.now() - syncStartTime,
+        offering,
+        error: 'Unable to sync offering from Stellar',
+        failureClass,
       };
       
       this.logger.error('Failed to sync offering from chain', {
@@ -368,132 +318,60 @@ export class OfferingSyncService {
     }
   }
 
-  /**
-   * Detect and recover stale catalog entries
-   * @param config Optional override for stale catalog configuration
-   * @returns StaleCatalogResult
-   */
-  async recoverStaleCatalog(config?: Partial<StaleCatalogConfig>): Promise<StaleCatalogResult> {
-    const startTime = Date.now();
-    const effectiveConfig = { ...this.staleConfig, ...config };
-    
-    this.logger.info('Starting stale catalog recovery', {
-      staleThresholdHours: effectiveConfig.staleThresholdHours,
-      batchSize: effectiveConfig.batchSize,
-      autoUpdate: effectiveConfig.autoUpdate,
-    });
+  async syncAll(): Promise<SyncResult[]> {
+    const offerings = await this.offeringRepository.listAll();
+    const results = await Promise.allSettled(
+      offerings.map((offering) => this.syncOfferingRecord(offering)),
+    );
 
-    try {
-      // Find offerings that haven't been updated recently
-      const staleThreshold = new Date(Date.now() - effectiveConfig.staleThresholdHours * 60 * 60 * 1000);
-      const staleOfferings = await this.findStaleOfferings(staleThreshold, effectiveConfig.batchSize);
-      
-      this.logger.info('Found stale offerings', {
-        count: staleOfferings.length,
-        threshold: staleThreshold.toISOString(),
-      });
-
-      const result: StaleCatalogResult = {
-        totalProcessed: staleOfferings.length,
-        staleFound: staleOfferings.length,
-        updated: 0,
-        failed: 0,
-        errors: [],
-        duration: 0,
-      };
-
-      // Process each stale offering
-      for (const offering of staleOfferings) {
-        try {
-          const syncResult = await this.syncFromChain(offering, Date.now());
-          
-          if (syncResult.success) {
-            if (syncResult.updated) {
-              result.updated++;
-              this.logger.info('Recovered stale offering', {
-                offeringId: offering.id,
-                contractAddress: offering.contract_address,
-              });
-            }
-          } else {
-            result.failed++;
-            result.errors.push({
-              offeringId: offering.id,
-              error: syncResult.error || 'Unknown error',
-              failureClass: syncResult.failureClass || StellarRPCFailureClass.UNKNOWN,
-            });
-          }
-        } catch (error) {
-          result.failed++;
-          const failureClass = classifyStellarRPCFailure(error);
-          result.errors.push({
-            offeringId: offering.id,
-            error: error instanceof Error ? error.message : String(error),
-            failureClass,
-          });
-        }
+    return results.map((result, index) => {
+      if (result.status === 'fulfilled') {
+        return result.value;
       }
 
-      result.duration = Date.now() - startTime;
+      const offering = offerings[index];
+      const failureClass = classifyStellarRPCFailure(result.reason);
 
-      this.logger.info('Stale catalog recovery completed', {
-        totalProcessed: result.totalProcessed,
-        updated: result.updated,
-        failed: result.failed,
-        duration: result.duration,
+      this.logger.error('Offering sync task failed unexpectedly', {
+        offeringId: offering.id,
+        contractAddress: offering.contract_address ?? '',
+        failureClass,
+        error: result.reason,
       });
 
-      return result;
-    } catch (error) {
-      this.logger.error('Failed to recover stale catalog', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
+      return {
+        offeringId: offering.id,
+        contractAddress: offering.contract_address ?? '',
+        success: false,
+        updated: false,
+        offering,
+        error: 'Unable to sync offering from Stellar',
+        failureClass,
+      };
+    });
+  }
+}
+
+export function getSynchronizedOffering(
+  result: SyncResult,
+  fallback: Offering,
+): Offering {
+  return result.offering ?? fallback;
+}
+
+function normalizeOnChainStatus(
+  status: OnChainOfferingState['status'],
+): UpdateOfferingStateInput['status'] | null {
+  const normalized = normalizeOfferingStatus(status);
+
+  if (
+    normalized === 'draft' ||
+    normalized === 'active' ||
+    normalized === 'closed' ||
+    normalized === 'completed'
+  ) {
+    return normalized;
   }
 
-  /**
-   * Find offerings that haven't been updated since the threshold
-   * @param threshold Date threshold for considering offerings stale
-   * @param limit Maximum number of offerings to return
-   * @returns Array of stale offerings
-   */
-  private async findStaleOfferings(threshold: Date, limit: number): Promise<Offering[]> {
-    // This would typically be implemented as a database query
-    // For now, we'll use the existing listAll method and filter
-    const allOfferings = await this.offeringRepository.listAll();
-    
-    return allOfferings
-      .filter(offering => 
-        offering.contract_address && // Must have contract address
-        offering.updated_at && // Must have updated timestamp
-        new Date(offering.updated_at) < threshold // Must be older than threshold
-      )
-      .slice(0, limit);
-  }
-
-  /**
-   * Get sync statistics and health information
-   */
-  async getSyncStats(): Promise<{
-    totalOfferings: number;
-    withContractAddress: number;
-    recentlyUpdated: number;
-    staleThreshold: Date;
-  }> {
-    const allOfferings = await this.offeringRepository.listAll();
-    const staleThreshold = new Date(Date.now() - this.staleConfig.staleThresholdHours * 60 * 60 * 1000);
-    
-    const stats = {
-      totalOfferings: allOfferings.length,
-      withContractAddress: allOfferings.filter(o => o.contract_address).length,
-      recentlyUpdated: allOfferings.filter(o => 
-        o.updated_at && new Date(o.updated_at) >= staleThreshold
-      ).length,
-      staleThreshold,
-    };
-
-    this.logger.debug('Sync statistics retrieved', stats);
-    return stats;
-  }
+  return null;
 }

@@ -28,19 +28,21 @@ export interface CreateSessionInput {
 export class SessionRepository {
   constructor(private db: Pool) {}
 
-  async createSession(input: CreateSessionInput): Promise<Session> {
+  async createSession(input: CreateSessionInput, client?: Pool): Promise<Session> {
+    const db = client || this.db;
     // allow explicit session id (for upstream session id generation) or default DB uuid.
     if (input.id) {
       const query = `
-        INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
-        VALUES ($1, $2, $3, $4, NOW())
+        INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, parent_id)
+        VALUES ($1, $2, $3, $4, NOW(), $5)
         RETURNING *
       `;
-      const result: QueryResult<Session> = await this.db.query(query, [
+      const result: QueryResult<Session> = await db.query(query, [
         input.id,
         input.user_id,
         input.token_hash,
         input.expires_at,
+        input.parent_id || null,
       ]);
       if (result.rows.length === 0) throw new Error('Failed to create session');
       return this.mapSession(result.rows[0]);
@@ -51,8 +53,8 @@ export class SessionRepository {
       VALUES ($1, $2, $3, $4, $5, NOW())
       RETURNING *
     `;
-    const result: QueryResult<Session> = await this.db.query(query, [
-      input.id || crypto.randomUUID(),
+    const result: QueryResult<Session> = await db.query(query, [
+      crypto.randomUUID(),
       input.user_id,
       input.token_hash,
       input.expires_at,
@@ -98,22 +100,31 @@ export class SessionRepository {
     return session.id;
   }
 
-  async findById(id: string): Promise<Session | null> {
+  async findById(id: string, client?: Pool): Promise<Session | null> {
+    const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE id = $1 LIMIT 1`;
-    const result: QueryResult<Session> = await this.db.query(query, [id]);
+    const result: QueryResult<Session> = await db.query(query, [id]);
     return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
   }
 
-  async findByParentId(parentId: string): Promise<Session | null> {
+  async findByIdForUpdate(id: string, client: Pool): Promise<Session | null> {
+    const query = `SELECT * FROM sessions WHERE id = $1 LIMIT 1 FOR UPDATE`;
+    const result: QueryResult<Session> = await client.query(query, [id]);
+    return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
+  }
+
+  async findByParentId(parentId: string, client?: Pool): Promise<Session | null> {
+    const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE parent_id = $1 LIMIT 1`;
-    const result: QueryResult<Session> = await this.db.query(query, [parentId]);
+    const result: QueryResult<Session> = await db.query(query, [parentId]);
     return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
   }
 
   /**
    * Revoke a session and all its descendants.
    */
-  async revokeSessionAndDescendants(sessionId: string): Promise<void> {
+  async revokeSessionAndDescendants(sessionId: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
     const query = `
       WITH RECURSIVE descendants AS (
         SELECT id FROM sessions WHERE id = $1
@@ -126,7 +137,7 @@ export class SessionRepository {
       WHERE id IN (SELECT id FROM descendants)
         AND revoked_at IS NULL;
     `;
-    await this.db.query(query, [sessionId]);
+    await db.query(query, [sessionId]);
   }
 
   /**
@@ -140,8 +151,9 @@ export class SessionRepository {
   /**
    * Delete all sessions belonging to a user (e.g. on password change).
    */
-  async deleteAllSessionsByUserId(userId: string): Promise<void> {
-    await this.db.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
+  async deleteAllSessionsByUserId(userId: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
+    await db.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
   }
 
   private mapSession(row: any): Session {
