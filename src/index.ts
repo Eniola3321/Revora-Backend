@@ -575,6 +575,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   apiRouter.post(
     '/offerings/validation-matrix',
     requireOfferingAuth,
+    offeringSanitizeMiddleware,
     createOfferingValidationHandler(),
   );
 
