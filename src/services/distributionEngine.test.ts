@@ -10,6 +10,7 @@ class MockDistributionRepo {
   public payouts: any[] = [];
   public failNextRunCount = 0;
   public failNextPayoutCount = 0;
+  public failSpecificPayouts: number[] = []; // indices of payouts that should fail
 
   async createDistributionRun(input: any): Promise<any> {
     if (this.failNextRunCount > 0) {
@@ -23,9 +24,14 @@ class MockDistributionRepo {
   }
 
   async createPayout(input: any): Promise<any> {
+    // Check if this specific payout should fail
+    const payoutIndex = this.payouts.length;
     if (this.failNextPayoutCount > 0) {
       this.failNextPayoutCount -= 1;
       throw new Error('Database error (payout)');
+    }
+    if (this.failSpecificPayouts.includes(payoutIndex)) {
+      throw new Error(`Simulated failure for payout at index ${payoutIndex}`);
     }
 
     const payout = { id: `p-${this.payouts.length + 1}`, ...input };
