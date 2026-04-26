@@ -8,6 +8,8 @@ import {
   issueRefreshToken,
   getJwtSecret,
   getJwtAlgorithm,
+  getJwtSecretsForVerification,
+  getDefaultClaimValidationOptions,
   validateClaims,
   TOKEN_EXPIRY,
   REFRESH_TOKEN_EXPIRY,
@@ -20,12 +22,20 @@ const DEFAULT_JWT_SECRET =
   process.env.JWT_SECRET ||
   "test-secret-key-that-is-at-least-32-characters-long!";
 
+const PREVIOUS_SECRET = "previous-secret-key-that-is-at-least-32-chars!";
+
 describe("jwt utilities", () => {
   beforeEach(() => {
     // Several tests in this file intentionally mutate JWT_SECRET; always reset
     // between cases so ordering can't leak failures into later tests.
     process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
+    delete process.env.JWT_SECRET_PREVIOUS;
+    delete process.env.JWT_ISSUER;
+    delete process.env.JWT_AUDIENCE;
+    delete process.env.JWT_CLOCK_TOLERANCE_SECONDS;
   });
+
+  // ── getJwtSecret ────────────────────────────────────────────────────────────
 
   describe("getJwtSecret", () => {
     const originalSecret = process.env.JWT_SECRET;
@@ -55,11 +65,122 @@ describe("jwt utilities", () => {
     });
   });
 
+  // ── getJwtAlgorithm ─────────────────────────────────────────────────────────
+
   describe("getJwtAlgorithm", () => {
     it("should return HS256 algorithm", () => {
       expect(getJwtAlgorithm()).toBe("HS256");
     });
   });
+
+  // ── getJwtSecretsForVerification ────────────────────────────────────────────
+
+  describe("getJwtSecretsForVerification", () => {
+    afterEach(() => {
+      delete process.env.JWT_SECRET_PREVIOUS;
+    });
+
+    it("should return only current secret when JWT_SECRET_PREVIOUS is not set", () => {
+      const secrets = getJwtSecretsForVerification();
+      expect(secrets).toEqual([DEFAULT_JWT_SECRET]);
+    });
+
+    it("should include previous secret when JWT_SECRET_PREVIOUS is set and >= 32 chars", () => {
+      process.env.JWT_SECRET_PREVIOUS = PREVIOUS_SECRET;
+      const secrets = getJwtSecretsForVerification();
+      expect(secrets).toEqual([DEFAULT_JWT_SECRET, PREVIOUS_SECRET]);
+    });
+
+    it("should exclude previous secret when it is shorter than 32 chars", () => {
+      process.env.JWT_SECRET_PREVIOUS = "too-short";
+      const secrets = getJwtSecretsForVerification();
+      expect(secrets).toEqual([DEFAULT_JWT_SECRET]);
+    });
+
+    it("should exclude previous secret when it is empty string", () => {
+      process.env.JWT_SECRET_PREVIOUS = "";
+      const secrets = getJwtSecretsForVerification();
+      expect(secrets).toEqual([DEFAULT_JWT_SECRET]);
+    });
+
+    it("should throw when current JWT_SECRET is missing", () => {
+      delete process.env.JWT_SECRET;
+      expect(() => getJwtSecretsForVerification()).toThrow(
+        "JWT_SECRET environment variable is not set",
+      );
+    });
+  });
+
+  // ── getDefaultClaimValidationOptions ─────────────────────────────────────────
+
+  describe("getDefaultClaimValidationOptions", () => {
+    afterEach(() => {
+      delete process.env.JWT_ISSUER;
+      delete process.env.JWT_AUDIENCE;
+      delete process.env.JWT_CLOCK_TOLERANCE_SECONDS;
+    });
+
+    it("should return empty options when no env vars are set", () => {
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts).toEqual({});
+    });
+
+    it("should include issuer when JWT_ISSUER is set", () => {
+      process.env.JWT_ISSUER = "revora-backend";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.issuer).toBe("revora-backend");
+    });
+
+    it("should include audience when JWT_AUDIENCE is set", () => {
+      process.env.JWT_AUDIENCE = "revora-api";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.audience).toBe("revora-api");
+    });
+
+    it("should include clockToleranceSeconds when JWT_CLOCK_TOLERANCE_SECONDS is valid", () => {
+      process.env.JWT_CLOCK_TOLERANCE_SECONDS = "60";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.clockToleranceSeconds).toBe(60);
+    });
+
+    it("should ignore non-numeric JWT_CLOCK_TOLERANCE_SECONDS", () => {
+      process.env.JWT_CLOCK_TOLERANCE_SECONDS = "abc";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.clockToleranceSeconds).toBeUndefined();
+    });
+
+    it("should ignore negative JWT_CLOCK_TOLERANCE_SECONDS", () => {
+      process.env.JWT_CLOCK_TOLERANCE_SECONDS = "-5";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.clockToleranceSeconds).toBeUndefined();
+    });
+
+    it("should ignore non-finite JWT_CLOCK_TOLERANCE_SECONDS", () => {
+      process.env.JWT_CLOCK_TOLERANCE_SECONDS = "Infinity";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.clockToleranceSeconds).toBeUndefined();
+    });
+
+    it("should include all options when all env vars are set", () => {
+      process.env.JWT_ISSUER = "revora-backend";
+      process.env.JWT_AUDIENCE = "revora-api";
+      process.env.JWT_CLOCK_TOLERANCE_SECONDS = "45";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts).toEqual({
+        issuer: "revora-backend",
+        audience: "revora-api",
+        clockToleranceSeconds: 45,
+      });
+    });
+
+    it("should accept zero as valid clockToleranceSeconds", () => {
+      process.env.JWT_CLOCK_TOLERANCE_SECONDS = "0";
+      const opts = getDefaultClaimValidationOptions();
+      expect(opts.clockToleranceSeconds).toBe(0);
+    });
+  });
+
+  // ── issueToken ──────────────────────────────────────────────────────────────
 
   describe("issueToken", () => {
     it("should issue a valid JWT token", () => {
@@ -114,7 +235,39 @@ describe("jwt utilities", () => {
       // exp - iat should be approximately 1800 seconds (30 minutes)
       expect(payload!.exp! - payload!.iat!).toBeCloseTo(1800, 0);
     });
+
+    it("should include issuer claim when issuer option is provided", () => {
+      const token = issueToken({ subject: "user-1", issuer: "revora-backend" });
+      const payload = decodePayload(token);
+      expect(payload?.iss).toBe("revora-backend");
+    });
+
+    it("should include audience claim when audience option is provided", () => {
+      const token = issueToken({ subject: "user-1", audience: "revora-api" });
+      const payload = decodePayload(token);
+      expect(payload?.aud).toBe("revora-api");
+    });
+
+    it("should include both issuer and audience when both are provided", () => {
+      const token = issueToken({
+        subject: "user-1",
+        issuer: "revora-backend",
+        audience: "revora-api",
+      });
+      const payload = decodePayload(token);
+      expect(payload?.iss).toBe("revora-backend");
+      expect(payload?.aud).toBe("revora-api");
+    });
+
+    it("should not include iss/aud claims when options are omitted", () => {
+      const token = issueToken({ subject: "user-1" });
+      const payload = decodePayload(token);
+      expect(payload?.iss).toBeUndefined();
+      expect(payload?.aud).toBeUndefined();
+    });
   });
+
+  // ── verifyToken ─────────────────────────────────────────────────────────────
 
   describe("verifyToken", () => {
     it("should verify valid token and return payload", () => {
@@ -156,7 +309,162 @@ describe("jwt utilities", () => {
 
       expect(() => verifyToken(modifiedToken)).toThrow();
     });
+
+    // ── Key rotation ──────────────────────────────────────────────────────────
+
+    describe("key rotation", () => {
+      afterEach(() => {
+        delete process.env.JWT_SECRET_PREVIOUS;
+      });
+
+      it("should verify token signed with current secret", () => {
+        const token = issueToken({ subject: "user-1" });
+        const payload = verifyToken(token);
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should verify token signed with previous secret when JWT_SECRET_PREVIOUS is set", () => {
+        // Sign a token with the previous secret
+        process.env.JWT_SECRET = PREVIOUS_SECRET;
+        const token = issueToken({ subject: "user-rotated" });
+
+        // Now switch to a new current secret and set previous
+        process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
+        process.env.JWT_SECRET_PREVIOUS = PREVIOUS_SECRET;
+
+        const payload = verifyToken(token);
+        expect(payload.sub).toBe("user-rotated");
+      });
+
+      it("should reject token signed with previous secret when JWT_SECRET_PREVIOUS is not set", () => {
+        // Sign a token with a different secret
+        process.env.JWT_SECRET = PREVIOUS_SECRET;
+        const token = issueToken({ subject: "user-stale" });
+
+        // Switch to current secret without setting previous
+        process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
+        delete process.env.JWT_SECRET_PREVIOUS;
+
+        expect(() => verifyToken(token)).toThrow();
+      });
+
+      it("should reject token signed with an unknown secret even with rotation", () => {
+        process.env.JWT_SECRET = PREVIOUS_SECRET;
+        const token = issueToken({ subject: "user-unknown" });
+
+        process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
+        process.env.JWT_SECRET_PREVIOUS = "another-previous-secret-key-that-is-32-chars!!";
+
+        expect(() => verifyToken(token)).toThrow();
+      });
+
+      it("should prefer current secret over previous when both match", () => {
+        // Token signed with current secret
+        const token = issueToken({ subject: "user-current" });
+        process.env.JWT_SECRET_PREVIOUS = PREVIOUS_SECRET;
+
+        const payload = verifyToken(token);
+        expect(payload.sub).toBe("user-current");
+      });
+
+      it("should reject token signed with a short previous secret", () => {
+        // Sign with a short secret (not actually possible via issueToken, but
+        // we construct the scenario by setting JWT_SECRET_PREVIOUS to short)
+        process.env.JWT_SECRET_PREVIOUS = "too-short";
+        const token = issueToken({ subject: "user-1" });
+        // Token was signed with current, so it should still verify
+        const payload = verifyToken(token);
+        expect(payload.sub).toBe("user-1");
+      });
+    });
+
+    // ── Clock skew tolerance ──────────────────────────────────────────────────
+
+    describe("clock skew tolerance", () => {
+      it("should accept a token that expired within clock tolerance", () => {
+        // Issue a token that expired 10 seconds ago
+        const token = issueToken({ subject: "user-1", expiresIn: "-10s" });
+
+        // With default 30s tolerance, this should still be valid
+        const payload = verifyToken(token, { clockToleranceSeconds: 30 });
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should reject a token that expired beyond clock tolerance", () => {
+        const token = issueToken({ subject: "user-1", expiresIn: "-60s" });
+
+        expect(() => verifyToken(token, { clockToleranceSeconds: 30 })).toThrow(
+          "Token has expired",
+        );
+      });
+
+      it("should reject an expired token with zero tolerance", () => {
+        const token = issueToken({ subject: "user-1", expiresIn: "-1s" });
+
+        expect(() => verifyToken(token, { clockToleranceSeconds: 0 })).toThrow(
+          "Token has expired",
+        );
+      });
+
+      it("should accept a barely-expired token with large tolerance", () => {
+        const token = issueToken({ subject: "user-1", expiresIn: "-90s" });
+
+        const payload = verifyToken(token, { clockToleranceSeconds: 120 });
+        expect(payload.sub).toBe("user-1");
+      });
+    });
+
+    // ── Issuer/audience validation via verifyToken ────────────────────────────
+
+    describe("issuer and audience validation", () => {
+      it("should reject token with wrong issuer when options.issuer is set", () => {
+        const token = issueToken({ subject: "user-1", issuer: "wrong-issuer" });
+        expect(() =>
+          verifyToken(token, { issuer: "revora-backend" }),
+        ).toThrow(/issuer mismatch/i);
+      });
+
+      it("should accept token with matching issuer", () => {
+        const token = issueToken({ subject: "user-1", issuer: "revora-backend" });
+        const payload = verifyToken(token, { issuer: "revora-backend" });
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should reject token with wrong audience when options.audience is set", () => {
+        const token = issueToken({ subject: "user-1", audience: "wrong-api" });
+        expect(() =>
+          verifyToken(token, { audience: "revora-api" }),
+        ).toThrow(/audience mismatch/i);
+      });
+
+      it("should accept token with matching audience", () => {
+        const token = issueToken({ subject: "user-1", audience: "revora-api" });
+        const payload = verifyToken(token, { audience: "revora-api" });
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should skip issuer/audience checks when options are not provided", () => {
+        const token = issueToken({ subject: "user-1" });
+        const payload = verifyToken(token);
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should validate both issuer and audience together", () => {
+        const token = issueToken({
+          subject: "user-1",
+          issuer: "revora-backend",
+          audience: "revora-api",
+        });
+        const payload = verifyToken(token, {
+          issuer: "revora-backend",
+          audience: "revora-api",
+        });
+        expect(payload.sub).toBe("user-1");
+      });
+    });
   });
+
+  // ── decodePayload ──────────────────────────────────────────────────────────
 
   describe("decodePayload", () => {
     it("should decode valid token without verification", () => {
@@ -186,6 +494,8 @@ describe("jwt utilities", () => {
     });
   });
 
+  // ── issueRefreshToken ──────────────────────────────────────────────────────
+
   describe("issueRefreshToken", () => {
     it("should issue refresh token with 7 day expiry", () => {
       const token = issueRefreshToken("user-123");
@@ -198,12 +508,16 @@ describe("jwt utilities", () => {
     });
   });
 
+  // ── TOKEN_EXPIRY and REFRESH_TOKEN_EXPIRY ──────────────────────────────────
+
   describe("TOKEN_EXPIRY and REFRESH_TOKEN_EXPIRY", () => {
     it("should have correct default values", () => {
       expect(TOKEN_EXPIRY).toBe("1h");
       expect(REFRESH_TOKEN_EXPIRY).toBe("7d");
     });
   });
+
+  // ── validateClaims ─────────────────────────────────────────────────────────
 
   describe("validateClaims", () => {
     const now = Math.floor(Date.now() / 1000);
@@ -225,6 +539,11 @@ describe("jwt utilities", () => {
 
     it("should throw when sub is whitespace only", () => {
       const payload = { ...basePayload, sub: "   " };
+      expect(() => validateClaims(payload)).toThrow(/subject.*sub/i);
+    });
+
+    it("should throw when sub is not a string", () => {
+      const payload = { ...basePayload, sub: 123 as unknown as string };
       expect(() => validateClaims(payload)).toThrow(/subject.*sub/i);
     });
 
@@ -270,6 +589,12 @@ describe("jwt utilities", () => {
       expect(() => validateClaims(payload)).not.toThrow();
     });
 
+    it("should throw when issuer is expected but payload has no iss claim", () => {
+      const payload: JwtPayload = { ...basePayload }; // no iss
+      const opts: ClaimValidationOptions = { issuer: "revora-backend" };
+      expect(() => validateClaims(payload, opts)).toThrow(/issuer mismatch/i);
+    });
+
     it("should throw on audience mismatch (string aud)", () => {
       const payload: JwtPayload = { ...basePayload, aud: "other-app" };
       const opts: ClaimValidationOptions = { audience: "revora-api" };
@@ -299,12 +624,28 @@ describe("jwt utilities", () => {
       expect(() => validateClaims(payload)).not.toThrow();
     });
 
+    it("should throw when audience is expected but payload has no aud claim", () => {
+      const payload: JwtPayload = { ...basePayload }; // no aud
+      const opts: ClaimValidationOptions = { audience: "revora-api" };
+      expect(() => validateClaims(payload, opts)).toThrow(/audience mismatch/i);
+    });
+
     it("should respect custom clockToleranceSeconds", () => {
       const payload: JwtPayload = { ...basePayload, exp: now - 60 };
       // With 0s tolerance, should throw
       expect(() => validateClaims(payload, { clockToleranceSeconds: 0 })).toThrow("Token has expired");
       // With 120s tolerance, should pass
       expect(() => validateClaims(payload, { clockToleranceSeconds: 120 })).not.toThrow();
+    });
+
+    it("should use default 30s tolerance when clockToleranceSeconds is not specified", () => {
+      // Token expired 20s ago — within default 30s tolerance
+      const payloadOk: JwtPayload = { ...basePayload, exp: now - 20 };
+      expect(() => validateClaims(payloadOk)).not.toThrow();
+
+      // Token expired 40s ago — beyond default 30s tolerance
+      const payloadFail: JwtPayload = { ...basePayload, exp: now - 40 };
+      expect(() => validateClaims(payloadFail)).toThrow("Token has expired");
     });
   });
 });

@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
+import { Errors } from '../lib/errors';
 
 type PrimitiveType = 'string' | 'number' | 'boolean';
+import { Request, Response, NextFunction } from 'express';
 
 export type FieldSchema = {
   type: PrimitiveType;
@@ -127,8 +129,7 @@ function makeMiddleware(
     const data = pick(req);
     const result = validateObject(data, schema, locationName);
     if (!result.valid) {
-      res.status(400).json({ error: 'ValidationError', details: result.errors });
-      return;
+      return next(Errors.validationError('Invalid request parameters', result.errors));
     }
     next();
   };
@@ -158,3 +159,8 @@ export function validate(arg: ObjectSchema | ValidateOptions): RequestHandler[] 
   return validateBody(arg as ObjectSchema);
 }
 
+/**
+ * @interface ValidationRule
+ * @description Defines a validation rule for a single field.
+ * @property {boolean} required - True if the field is mandatory.
+ * @property
