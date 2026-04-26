@@ -10,6 +10,8 @@ type Config = {
   STELLAR_NETWORK: "testnet" | "public";
   STELLAR_HORIZON_URL?: string;
   STELLAR_NETWORK_PASSPHRASE?: string;
+  STELLAR_TIMEOUT: number;
+  STELLAR_MAX_FEE: number;
   ALLOWED_ORIGINS: string[];
 };
 
@@ -47,10 +49,24 @@ function parseAllowedOrigins(value?: string): string[] {
     .filter((origin) => origin.length > 0);
 }
 
+function parseStellarTimeout(value?: string): number {
+  const n = Number.parseInt(value ?? "", 10);
+  if (Number.isFinite(n) && n > 0 && n <= 300000) return n; // Max 5 minutes
+  return 30000; // Default 30 seconds
+}
+
+function parseStellarMaxFee(value?: string): number {
+  const n = Number.parseInt(value ?? "", 10);
+  if (Number.isFinite(n) && n > 0 && n <= 10000000) return n; // Max 10 XLM in stroops
+  return 100000; // Default 0.1 XLM in stroops
+}
+
 function buildConfig(): Config {
   const NODE_ENV = normalizeNodeEnv(process.env.NODE_ENV);
   const PORT = parsePort(process.env.PORT);
   const STELLAR_NETWORK = normalizeStellarNetwork(process.env.STELLAR_NETWORK);
+  const STELLAR_TIMEOUT = parseStellarTimeout(process.env.STELLAR_TIMEOUT);
+  const STELLAR_MAX_FEE = parseStellarMaxFee(process.env.STELLAR_MAX_FEE);
   const ALLOWED_ORIGINS = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
 
   const cfg: Config = {
@@ -61,6 +77,8 @@ function buildConfig(): Config {
     STELLAR_NETWORK,
     STELLAR_HORIZON_URL: process.env.STELLAR_HORIZON_URL,
     STELLAR_NETWORK_PASSPHRASE: process.env.STELLAR_NETWORK_PASSPHRASE,
+    STELLAR_TIMEOUT,
+    STELLAR_MAX_FEE,
     ALLOWED_ORIGINS,
   };
 

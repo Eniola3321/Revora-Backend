@@ -13,30 +13,63 @@ export interface SubmitRevenueReportInput {
     amount: string;
     periodStart: Date;
     periodEnd: Date;
+    requestId?: string;
 }
 
+/**
+ * Decimal boundary limits for revenue amounts.
+ * @dev Database schema uses NUMERIC(30,10) for amounts to preserve precision.
+ *      This allows up to 20 integer digits and 10 decimal places (10^-10 cents minimum).
+ */
+const DECIMAL_LIMITS = {
+    /** Maximum number of integer digits before decimal point */
+    MAX_INTEGER_DIGITS: 20,
+    /** Maximum number of fractional digits after decimal point */
+    MAX_DECIMAL_PLACES: 10,
+    /** Maximum representable amount (20 nines + decimal + 10 nines) */
+    MAX_AMOUNT: '99999999999999999999.9999999999',
+    /** Minimum positive amount (essentially 0.0000000001) */
+    MIN_AMOUNT: '0.0000000001',
+} as const;
+
+/**
+ * RevenueService: Business logic for revenue report submission and validation.
+ *
+ * Security Assumptions:
+ * - The `issuerId` has been authenticated via JWT middleware before service invocation.
+ * - The offering ownership check is performed before any state-modifying operations.
+ * - Database transactions (if configured) provide ACID guarantees for concurrency safety.
+ *
+ * Validation Rules:
+ * - Amount must be a positive decimal string with at most 10 decimal places (database NUMERIC precision).
+ * - Period end must be strictly after period start (prevents zero-width or negative ranges).
+ * - New reports cannot overlap with any existing report for the same offering.
+ * - Amount cannot exceed 20 integer digits (prevents integer overflow in Stellar operations).
+ *
+ * @module services/revenueService
+ */
 export class RevenueService {
+    private logger: Logger;
+
     constructor(
         private offeringRepo: OfferingRepository,
         private revenueReportRepo: RevenueReportRepository
-    ) { }
+    ) {
+        this.logger = new Logger({ level: LogLevel.INFO });
+    }
 
     /**
      * @notice Submits and validates a revenue report for a specific offering.
      * @dev Hardened with production-grade validation for amounts and reporting periods.
      * 
-     * Security Assumptions:
-     * 1. The `issuerId` has been authenticated via JWT middleware.
-     * 2. The `issuerId` is the primary owner of the `offeringId`.
-     * 
-     * Validation Rules:
-     * - Amount must be a valid positive decimal string (max 10 decimal places).
-     * - Period end date must be strictly after the start date.
-     * - New reports cannot overlap with any existing reports for the same offering.
+     * Decimal Precision:
+     * - Database schema: NUMERIC(30,10) - supports up to 20 integer + 10 decimal places.
+     * - Input validation: Rejects amounts exceeding these boundaries.
+     * - String storage: Amounts stored as strings in JSON to preserve precision.
      * 
      * @param input - The revenue report data containing offering, amount, and period.
      * @returns The persisted RevenueReport object.
-     * @throws Error if validation fails or unauthorized access is detected.
+     * @throws AppError if validation fails or unauthorized access is detected.
      */
     async submitReport(input: SubmitRevenueReportInput): Promise<RevenueReport> {
         // 1. Validate offering existence and ownership
@@ -48,6 +81,7 @@ export class RevenueService {
         if (offering.issuer_id !== input.issuerId) {
             throw Errors.forbidden(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
         }
+    }
 
         // 2. Validate amount format and value
         const amountRegex = /^\d+(\.\d{1,10})?$/;
@@ -142,23 +176,43 @@ export class RevenueService {
             );
         }
 
-        // 5. Persist report
-        const report = await this.revenueReportRepo.create({
-            offering_id: input.offeringId,
-            issuer_id: input.issuerId,
-            amount: input.amount,
-            period_start: input.periodStart,
-            period_end: input.periodEnd,
-            reported_by: input.issuerId, // Assuming reporter is the issuer for now
-        });
+        // ─── Check fractional part length ────────────────────────────────────────
+        if (fractionalPart.length > DECIMAL_LIMITS.MAX_DECIMAL_PLACES) {
+            return {
+                valid: false,
+                reason: `Decimal places exceed maximum ${DECIMAL_LIMITS.MAX_DECIMAL_PLACES} places`,
+                details: {
+                    provided: fractionalPart.length,
+                    maximum: DECIMAL_LIMITS.MAX_DECIMAL_PLACES,
+                    providedValue: amount,
+                },
+            };
+        }
 
-        // 6. Optionally emit event for distribution engine
-        this.emitDistributionEvent(report);
+        // ─── Check numeric value > 0 ────────────────────────────────────────────
+        const numValue = parseFloat(amount);
+        if (!Number.isFinite(numValue) || numValue <= 0) {
+            return {
+                valid: false,
+                reason: 'Amount must be a positive number greater than zero',
+                details: { providedValue: amount },
+            };
+        }
 
-        return report;
+        // ─── Check against explicit maximum ─────────────────────────────────────
+        const maxNum = parseFloat(DECIMAL_LIMITS.MAX_AMOUNT);
+        if (numValue > maxNum) {
+            return {
+                valid: false,
+                reason: `Amount exceeds maximum allowed value of ${DECIMAL_LIMITS.MAX_AMOUNT}`,
+                details: { providedValue: amount, maximum: DECIMAL_LIMITS.MAX_AMOUNT },
+            };
+        }
+
+        return { valid: true };
     }
 
-    private emitDistributionEvent(report: RevenueReport) {
+    private emitDistributionEvent(report: RevenueReport, requestId: string): void {
         // Placeholder for event emission logic
         // This could be a message to a queue (e.g., RabbitMQ, Kafka) or a PubSub system
         globalLogger.info(`Revenue report submitted for offering ${report.offering_id}. Triggering distribution engine...`, {
