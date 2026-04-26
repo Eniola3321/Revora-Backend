@@ -4,15 +4,17 @@ import cors from 'cors';
 import morgan from 'morgan';
 import { pool } from './db/pool';
 import { createRequireAuth } from './middleware/auth';
+import { createCorsMiddleware } from './middleware/cors';
 import { SessionRepository } from './db/repositories/sessionRepository';
 import { createLogoutRouter } from './auth/logout/logoutRoute';
 import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
 import { createLoginRouter } from './auth/login/loginRoute';
-import { createRefreshRouter } from './auth/refresh/refreshRoute';
-import { RefreshService } from './auth/refresh/refreshService';
-import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
-import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
-import { Logger } from './lib/logger';
+import { createHealthRouter } from './routes/health';
+import { UserRepository } from './db/repositories/userRepository';
+import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionRepository as ISessionRepository } from './auth/login/types';
+import { LoginService } from './auth/login/loginService';
+import { issueToken } from './lib/jwt';
+import { MetricsCollector } from './lib/metrics';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -73,9 +75,16 @@ class JwtIssuerImpl implements JwtIssuer {
 export function createApp() {
   const app = express();
 
-  app.use(cors());
+  app.use(createCorsMiddleware());
   app.use(express.json());
   app.use(morgan('dev'));
+
+  // Initialize metrics collector
+  const metrics = new MetricsCollector({
+    enabled: true,
+    maxCardinality: 1000,
+    enablePIIDetection: true,
+  });
 
   const sessionRepository = new SessionRepository(pool);
   const requireAuth = createRequireAuth(sessionRepository);
@@ -95,7 +104,7 @@ export function createApp() {
   app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
-  app.use('/api/v1/health', createHealthRouter(pool));
+  app.use('/api/v1/health', createHealthRouter(pool, metrics));
 
   return app;
 }

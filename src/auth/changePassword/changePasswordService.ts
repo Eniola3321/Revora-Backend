@@ -1,9 +1,7 @@
 import { hashPassword, comparePassword as verifyPassword } from '../../utils/password';
 import { validatePasswordStrength } from '../../lib/passwordStrength';
-import { Pool } from 'pg';
-import { withTransaction } from '../../db/transaction';
-import { SessionRepository } from '../../db/repositories/sessionRepository';
-import { Logger } from '../../lib/logger';
+import { Errors } from '../../lib/errors';
+import { globalLogger } from '../../lib/logger';
 
 // ── Port interface ────────────────────────────────────────────────────────────
 // Keeps the service decoupled from pg and the concrete UserRepository.
@@ -19,13 +17,9 @@ export interface ChangePasswordInput {
   newPassword: string;
 }
 
-export type ChangePasswordResult =
-  | { ok: true }
-  | {
-      ok: false;
-      reason: 'USER_NOT_FOUND' | 'WRONG_PASSWORD' | 'VALIDATION_ERROR';
-      message: string;
-    };
+export interface ChangePasswordResult {
+  ok: true;
+}
 
 // ── Service ───────────────────────────────────────────────────────────────────
 export class ChangePasswordService {
@@ -41,48 +35,33 @@ export class ChangePasswordService {
 
     // Validate inputs first (cheap, no DB hit)
     if (!currentPassword) {
-      return {
-        ok: false,
-        reason: 'VALIDATION_ERROR',
-        message: 'currentPassword is required.',
-      };
+      throw Errors.badRequest('currentPassword is required.');
     }
 
     // Validate new password strength
     const strength = validatePasswordStrength(newPassword);
     if (!strength.isValid) {
-      return {
-        ok: false,
-        reason: 'VALIDATION_ERROR',
-        message: `New password does not meet strength requirements: ${strength.errors.join(', ')}`,
-      };
+      globalLogger.warn('Change password failed: weak new password', {
+        userId,
+        errorCodes: strength.errors.map((e) => e.code),
+      });
+      throw Errors.validationError('New password does not meet strength requirements', {
+        errors: strength.errors,
+      });
     }
 
-    // Execute password change and session invalidation in a transaction
-    return withTransaction(this.db, async (client) => {
-      // Load user
-      const user = await this.userRepo.findUserById(userId);
-      if (!user) {
-        return { ok: false, reason: 'USER_NOT_FOUND', message: 'User not found.' };
-      }
+    // Load user
+    const user = await this.userRepo.findUserById(userId);
+    if (!user) {
+      throw Errors.notFound('User not found.');
+    }
 
-      // Verify current password using scrypt timing-safe compare (src/lib/hash.ts)
-      const isMatch = await verifyPassword(currentPassword, user.password_hash);
-      if (!isMatch) {
-        return {
-          ok: false,
-          reason: 'WRONG_PASSWORD',
-          message: 'Current password is incorrect.',
-        };
-      }
-
-      // Hash and persist new password
-      const newHash = await hashPassword(newPassword);
-      await this.userRepo.updatePasswordHash(userId, newHash);
-
-      // Invalidate all sessions for security (prevents race condition where
-      // a refresh token could be used milliseconds before password change)
-      await this.sessionRepo.deleteAllSessionsByUserId(userId, client);
+    // Verify current password using scrypt timing-safe compare (src/lib/hash.ts)
+    const isMatch = await verifyPassword(currentPassword, user.password_hash);
+    if (!isMatch) {
+      globalLogger.warn('Change password failed: incorrect current password', { userId });
+      throw Errors.badRequest('Current password is incorrect.');
+    }
 
       this.logger.info('Password changed and sessions invalidated', {
         userId,

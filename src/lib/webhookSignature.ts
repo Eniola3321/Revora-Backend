@@ -202,6 +202,12 @@ export interface WebhookVerificationConfig {
   requireTimestamp?: boolean;
   /** Maximum age of webhook in milliseconds for replay protection (default: 5 minutes) */
   maxAgeMs?: number;
+  /**
+   * Allowed clock drift for future-dated timestamps in milliseconds (default: 30 seconds).
+   * Sender clocks may be slightly ahead of the receiver — this window tolerates that skew
+   * without opening a replay window large enough to be exploitable.
+   */
+  clockSkewMs?: number;
 }
 
 /**
@@ -247,6 +253,7 @@ export function verifyWebhook(
     maxPayloadSize = 1024 * 1024, // 1MB default
     requireTimestamp = false,
     maxAgeMs = 5 * 60 * 1000, // 5 minutes default
+    clockSkewMs = 30 * 1000, // 30 seconds tolerance for sender clock drift
   } = config;
 
   // Check payload size
@@ -317,11 +324,13 @@ export function verifyWebhook(
     const now = Date.now();
     const age = now - timestamp.getTime();
 
-    if (age < 0 || age > maxAgeMs) {
+    // Negative age means the timestamp is in the future (sender's clock ahead of ours).
+    // Allow up to clockSkewMs of forward drift to handle distributed-system clock variance.
+    if (age < -clockSkewMs || age > maxAgeMs) {
       return {
         valid: false,
         error: new WebhookSignatureError(
-          `Webhook timestamp outside acceptable window (max age: ${maxAgeMs}ms)`,
+          `Webhook timestamp outside acceptable window (max age: ${maxAgeMs}ms, clock skew: ${clockSkewMs}ms)`,
           'VERIFICATION_FAILED'
         ),
       };
