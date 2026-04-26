@@ -180,7 +180,8 @@ export async function withTransaction<T>(
         logger.warn('Transaction rolled back successfully');
       } catch (rollbackError) {
         rollbackSucceeded = false;
-        logger.error('Rollback failed', { error: sanitizeError(rollbackError) });
+        // Log rollback failure but throw original error
+        console.error('[transaction] Rollback failed:', sanitizeError(rollbackError));
       }
     }
 

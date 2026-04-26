@@ -4,8 +4,8 @@ import {
     CreateRevenueReportInput,
     RevenueReport,
 } from '../db/repositories/revenueReportRepository';
-import { Logger, LogLevel } from '../lib/logger';
 import { Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 export interface SubmitRevenueReportInput {
     offeringId: string;
@@ -72,205 +72,108 @@ export class RevenueService {
      * @throws AppError if validation fails or unauthorized access is detected.
      */
     async submitReport(input: SubmitRevenueReportInput): Promise<RevenueReport> {
-        const requestId = input.requestId || 'unknown';
+        // 1. Validate offering existence and ownership
+        const offering = await this.offeringRepo.findById(input.offeringId);
+        if (!offering) {
+            throw Errors.notFound(`Offering ${input.offeringId} not found`);
+        }
 
-        try {
-            this.logger.debug('Starting revenue report submission', {
-                requestId,
-                offeringId: input.offeringId,
-                issuerId: input.issuerId,
-                amount: input.amount,
-            });
-
-            // ─── 1. Validate offering existence ──────────────────────────────────────
-            const offering = await this.offeringRepo.findById(input.offeringId);
-            if (!offering) {
-                this.logger.warn('Revenue submission: offering not found', {
-                    requestId,
-                    offeringId: input.offeringId,
-                });
-                throw Errors.notFound(`Offering with ID ${input.offeringId} not found`);
-            }
-
-            // ─── 2. Validate offering ownership ──────────────────────────────────────
-            if (offering.issuer_id !== input.issuerId) {
-                this.logger.warn('Revenue submission: unauthorized offering access', {
-                    requestId,
-                    offeringId: input.offeringId,
-                    expectedIssuerId: offering.issuer_id,
-                    providedIssuerId: input.issuerId,
-                });
-                throw Errors.forbidden(
-                    `You do not have permission to submit revenue reports for this offering`
-                );
-            }
-
-            // ─── 3. Validate and parse amount (decimal boundaries) ───────────────────
-            const amountValidation = this.validateDecimalAmount(input.amount);
-            if (!amountValidation.valid) {
-                this.logger.warn('Revenue submission: invalid amount format', {
-                    requestId,
-                    amount: input.amount,
-                    reason: amountValidation.reason,
-                });
-                throw Errors.badRequest(
-                    `Invalid revenue amount: ${amountValidation.reason}`,
-                    { amount: input.amount, details: amountValidation.details }
-                );
-            }
-
-            const amountNum = parseFloat(input.amount);
-
-            // ─── 4. Validate period logic (dates must be properly ordered) ─────────────
-            if (input.periodEnd <= input.periodStart) {
-                this.logger.warn('Revenue submission: invalid period ordering', {
-                    requestId,
-                    periodStart: input.periodStart.toISOString(),
-                    periodEnd: input.periodEnd.toISOString(),
-                });
-                throw Errors.badRequest(
-                    'Invalid period: end date must be strictly after start date',
-                    {
-                        periodStart: input.periodStart.toISOString(),
-                        periodEnd: input.periodEnd.toISOString(),
-                    }
-                );
-            }
-
-            // ─── 5. Check for overlapping periods ────────────────────────────────────
-            const overlapping = await this.revenueReportRepo.findOverlappingReport(
-                input.offeringId,
-                input.periodStart,
-                input.periodEnd
-            );
-
-            if (overlapping) {
-                this.logger.warn('Revenue submission: overlapping period detected', {
-                    requestId,
-                    offeringId: input.offeringId,
-                    newPeriodStart: input.periodStart.toISOString(),
-                    newPeriodEnd: input.periodEnd.toISOString(),
-                    existingReportId: overlapping.id,
-                    existingPeriodStart: overlapping.period_start?.toISOString(),
-                    existingPeriodEnd: overlapping.period_end?.toISOString(),
-                });
-                throw Errors.conflict(
-                    `A revenue report already exists that overlaps with the specified period`,
-                    {
-                        newPeriod: {
-                            start: input.periodStart.toISOString(),
-                            end: input.periodEnd.toISOString(),
-                        },
-                        existingPeriod: {
-                            start: overlapping.period_start?.toISOString(),
-                            end: overlapping.period_end?.toISOString(),
-                        },
-                        existingReportId: overlapping.id,
-                    }
-                );
-            }
-
-            // ─── 6. Persist report ──────────────────────────────────────────────────
-            this.logger.info('Revenue report validation passed, persisting', {
-                requestId,
-                offeringId: input.offeringId,
-                issuerId: input.issuerId,
-                amount: input.amount,
-                amountNum: amountNum.toString(),
-            });
-
-            const report = await this.revenueReportRepo.create({
-                offering_id: input.offeringId,
-                issuer_id: input.issuerId,
-                amount: input.amount,
-                period_start: input.periodStart,
-                period_end: input.periodEnd,
-                reported_by: input.issuerId, // Assuming reporter is the issuer for now
-            });
-
-            this.logger.info('Revenue report persisted successfully', {
-                requestId,
-                reportId: report.id,
-                offeringId: input.offeringId,
-            });
-
-            // ─── 7. Emit event for distribution engine ──────────────────────────────
-            this.emitDistributionEvent(report, requestId);
-
-            return report;
-        } catch (error) {
-            // Re-throw AppErrors as-is; they're already properly structured
-            if (error instanceof Error && (error as any).statusCode !== undefined) {
-                throw error;
-            }
-            // Unexpected errors get sanitized
-            this.logger.error('Unexpected error during revenue submission', {
-                requestId,
-                error: error instanceof Error ? error.message : String(error),
-            });
-            throw Errors.internal('An unexpected error occurred during revenue submission');
+        if (offering.issuer_id !== input.issuerId) {
+            throw Errors.forbidden(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
         }
     }
 
-    /**
-     * Validates a decimal amount string against database precision limits.
-     *
-     * @dev Enforces:
-     *      - Positive value (no negative or zero amounts).
-     *      - Valid decimal format (at most one decimal point).
-     *      - Maximum 20 integer digits (prevents overflow in Stellar operations).
-     *      - Maximum 10 decimal places (matches database NUMERIC(30,10) precision).
-     *      - No leading zeros beyond single zero before decimal (e.g., 0.5 is valid, 00.5 is not).
-     *      - No exponential notation (e.g., 1e6 rejected).
-     *
-     * @param amount - The amount string to validate.
-     * @returns Validation result with `valid` flag and detailed reason/details if invalid.
-     */
-    private validateDecimalAmount(amount: string): {
-        valid: boolean;
-        reason?: string;
-        details?: Record<string, unknown>;
-    } {
-        // ─── Empty or non-string check ───────────────────────────────────────────
-        if (typeof amount !== 'string' || amount.length === 0) {
-            return { valid: false, reason: 'Amount must be a non-empty string' };
+        // 2. Validate amount format and value
+        const amountRegex = /^\d+(\.\d{1,10})?$/;
+        if (!amountRegex.test(input.amount)) {
+            throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
         }
 
-        // ─── Reject exponential notation ─────────────────────────────────────────
-        if (amount.includes('e') || amount.includes('E')) {
-            return {
-                valid: false,
-                reason: 'Exponential notation is not allowed',
-                details: { example: 'use 1000000 instead of 1e6' },
-            };
+        const amountNum = parseFloat(input.amount);
+        if (amountNum <= 0) {
+            throw Errors.validationError('Invalid revenue amount: must be greater than zero');
         }
 
-        // ─── Basic format validation ─────────────────────────────────────────────
-        // Must be digits optionally followed by a decimal point and more digits
-        if (!/^\d+(\.\d+)?$/.test(amount)) {
-            return {
-                valid: false,
-                reason: 'Amount must be a positive decimal number (digits and optional decimal point only)',
-                details: { providedValue: amount },
-            };
+        // 3. Validate period logic
+        if (input.periodEnd <= input.periodStart) {
+            throw Errors.validationError('Invalid period: end date must be strictly after start date');
         }
 
-        // ─── Split integer and fractional parts ──────────────────────────────────
-        const parts = amount.split('.');
-        const integerPart = parts[0];
-        const fractionalPart = parts[1] || '';
+        // 4. Enforce non-overlapping periods per offering
+        const overlapping = await this.revenueReportRepo.findOverlappingReport(
+            input.offeringId,
+            input.periodStart,
+            input.periodEnd
+        );
+      }
+    } catch (error) {
+      this.logger.warn('Invalid revenue amount format', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        `Invalid revenue amount: ${amount}`,
+        400,
+        { field: 'amount', value: amount }
+      );
+    }
 
-        // ─── Check integer part length ───────────────────────────────────────────
-        if (integerPart.length > DECIMAL_LIMITS.MAX_INTEGER_DIGITS) {
-            return {
-                valid: false,
-                reason: `Integer part exceeds maximum ${DECIMAL_LIMITS.MAX_INTEGER_DIGITS} digits`,
-                details: {
-                    provided: integerPart.length,
-                    maximum: DECIMAL_LIMITS.MAX_INTEGER_DIGITS,
-                    providedValue: amount,
-                },
-            };
+    // 2. Validate period dates
+    const startDate = new Date(periodStart);
+    const endDate = new Date(periodEnd);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        'Invalid date format for periodStart or periodEnd. Must be ISO 8601.',
+        400,
+        { periodStart, periodEnd }
+      );
+    }
+
+    if (startDate >= endDate) {
+      throw new AppError(
+        ErrorCode.VALIDATION_ERROR,
+        'periodEnd must be after periodStart.',
+        400,
+        { periodStart, periodEnd }
+      );
+    }
+
+    // 3. Convert amount to Soroban i128 scaled BigInt
+    let amountI128: BigInt;
+    try {
+      amountI128 = decimalAmount.toSorobanI128(SOROBAN_I128_SCALE);
+    } catch (error) {
+      this.logger.error('Failed to convert decimal amount to Soroban i128', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        ErrorCode.INTERNAL_ERROR,
+        'Failed to process revenue amount for Soroban.',
+        500,
+        { offeringId, amount }
+      );
+    }
+
+    // 4. Submit to Stellar/Soroban
+    let transactionId: string;
+    try {
+      transactionId = await this.stellarService.submitRevenueToSoroban(
+        offeringId,
+        amountI128,
+        startDate,
+        endDate
+      );
+      this.logger.info('Revenue submitted to Soroban', { offeringId, amount, amountI128: amountI128.toString(), transactionId });
+    } catch (error) {
+      this.logger.error('Stellar RPC submission failed', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
+      // Use a utility to classify Stellar RPC failures into AppErrors
+      throw this.classifyStellarRPCFailure(error);
+    }
+
+        if (overlapping) {
+            throw Errors.conflict(
+                `A revenue report already exists that overlaps with the specified period (${input.periodStart.toISOString()} - ${input.periodEnd.toISOString()})`
+            );
         }
 
         // ─── Check fractional part length ────────────────────────────────────────
@@ -312,11 +215,21 @@ export class RevenueService {
     private emitDistributionEvent(report: RevenueReport, requestId: string): void {
         // Placeholder for event emission logic
         // This could be a message to a queue (e.g., RabbitMQ, Kafka) or a PubSub system
-        this.logger.info('Emitting distribution event for revenue report', {
-            requestId,
+        globalLogger.info(`Revenue report submitted for offering ${report.offering_id}. Triggering distribution engine...`, {
             reportId: report.id,
             offeringId: report.offering_id,
             amount: report.amount,
+            periodStart: report.period_start,
+            periodEnd: report.period_end,
         });
     }
+
+    // Generic fallback for unclassified errors
+    this.logger.error('Unclassified Stellar RPC error', { error });
+    return new AppError(
+      ErrorCode.INTERNAL_ERROR,
+      'An unexpected error occurred while interacting with the Stellar network.',
+      500
+    );
+  }
 }

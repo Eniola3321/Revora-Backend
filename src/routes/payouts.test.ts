@@ -1,5 +1,12 @@
 import assert from 'assert';
 import { createPayoutsHandlers, Payout, PayoutListResponse } from './payouts';
+import {
+  classifyStellarRPCFailure,
+  isStellarRPCRetryable,
+  StellarRPCFailureClass,
+  STELLAR_TX_RESULT_CODES,
+  STELLAR_OP_RESULT_CODES,
+} from '../lib/stellarRpcFailure';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -518,5 +525,320 @@ describe('payouts routes', () => {
       await failHandlers.listPayouts(makeReq(INVESTOR), res, (e: any) => { capturedErr = e; });
       assert(capturedErr instanceof Error && capturedErr.message === 'DB error');
     });
+  });
+});
+
+// ─── Stellar Result Code Classification ──────────────────────────────────────
+
+describe('classifyStellarRPCFailure – result codes', () => {
+  // ── Transaction-level result codes ────────────────────────────────────────
+
+  describe('tx result codes', () => {
+    const txCodes = Array.from(STELLAR_TX_RESULT_CODES);
+
+    it.each(txCodes)('classifies tx code "%s" as TX_RESULT_CODE', (code) => {
+      const err = { status: 400, extras: { result_codes: { transaction: code, operations: [] } } };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+    });
+
+    it('classifies tx_bad_seq as TX_RESULT_CODE (explicit)', () => {
+      const err = { status: 400, extras: { result_codes: { transaction: 'tx_bad_seq' } } };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+    });
+
+    it('classifies tx_insufficient_fee as TX_RESULT_CODE (explicit)', () => {
+      const err = { status: 400, extras: { result_codes: { transaction: 'tx_insufficient_fee' } } };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+    });
+
+    it('classifies tx_bad_auth as TX_RESULT_CODE', () => {
+      const err = { status: 400, extras: { result_codes: { transaction: 'tx_bad_auth' } } };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+    });
+
+    it('does not classify unknown tx code as TX_RESULT_CODE', () => {
+      const err = { status: 400, extras: { result_codes: { transaction: 'tx_unknown_future_code' } } };
+      // Falls through to UNKNOWN since status 400 has no other handler
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.UNKNOWN);
+    });
+  });
+
+  // ── Operation-level result codes ──────────────────────────────────────────
+
+  describe('op result codes', () => {
+    const opCodes = Array.from(STELLAR_OP_RESULT_CODES);
+
+    it.each(opCodes)('classifies op code "%s" as OP_RESULT_CODE', (code) => {
+      const err = {
+        status: 400,
+        extras: { result_codes: { transaction: 'tx_failed', operations: [code] } },
+      };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+    });
+
+    it('classifies op_no_destination as OP_RESULT_CODE (explicit)', () => {
+      const err = {
+        status: 400,
+        extras: { result_codes: { transaction: 'tx_failed', operations: ['op_no_destination'] } },
+      };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+    });
+
+    it('classifies op_underfunded as OP_RESULT_CODE (explicit)', () => {
+      const err = {
+        status: 400,
+        extras: { result_codes: { transaction: 'tx_failed', operations: ['op_underfunded'] } },
+      };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+    });
+
+    it('op codes take precedence over tx codes', () => {
+      const err = {
+        status: 400,
+        extras: {
+          result_codes: { transaction: 'tx_failed', operations: ['op_no_trust', 'op_success'] },
+        },
+      };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+    });
+
+    it('falls back to TX_RESULT_CODE when ops array has no known codes', () => {
+      const err = {
+        status: 400,
+        extras: {
+          result_codes: { transaction: 'tx_bad_seq', operations: ['op_success'] },
+        },
+      };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+    });
+
+    it('handles missing operations array gracefully', () => {
+      const err = {
+        status: 400,
+        extras: { result_codes: { transaction: 'tx_bad_seq' } },
+      };
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+    });
+  });
+
+  // ── HTTP status codes (existing behaviour preserved) ──────────────────────
+
+  describe('http status codes', () => {
+    it('classifies 429 as RATE_LIMIT', () => {
+      assert.strictEqual(classifyStellarRPCFailure({ status: 429 }), StellarRPCFailureClass.RATE_LIMIT);
+    });
+
+    it('classifies 401 as UNAUTHORIZED', () => {
+      assert.strictEqual(classifyStellarRPCFailure({ status: 401 }), StellarRPCFailureClass.UNAUTHORIZED);
+    });
+
+    it('classifies 403 as UNAUTHORIZED', () => {
+      assert.strictEqual(classifyStellarRPCFailure({ status: 403 }), StellarRPCFailureClass.UNAUTHORIZED);
+    });
+
+    it('classifies 500 as UPSTREAM_ERROR', () => {
+      assert.strictEqual(classifyStellarRPCFailure({ status: 500 }), StellarRPCFailureClass.UPSTREAM_ERROR);
+    });
+
+    it('classifies 503 as UPSTREAM_ERROR', () => {
+      assert.strictEqual(classifyStellarRPCFailure({ status: 503 }), StellarRPCFailureClass.UPSTREAM_ERROR);
+    });
+  });
+
+  // ── Timeout / abort ───────────────────────────────────────────────────────
+
+  describe('timeout and abort', () => {
+    it('classifies AbortError as TIMEOUT', () => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TIMEOUT);
+    });
+
+    it('classifies message containing "timeout" as TIMEOUT', () => {
+      assert.strictEqual(
+        classifyStellarRPCFailure(new Error('Request timeout after 30s')),
+        StellarRPCFailureClass.TIMEOUT,
+      );
+    });
+  });
+
+  // ── Malformed response ────────────────────────────────────────────────────
+
+  describe('malformed response', () => {
+    it('classifies SyntaxError as MALFORMED_RESPONSE', () => {
+      assert.strictEqual(
+        classifyStellarRPCFailure(new SyntaxError('Unexpected token')),
+        StellarRPCFailureClass.MALFORMED_RESPONSE,
+      );
+    });
+  });
+
+  // ── Unknown / fallback ────────────────────────────────────────────────────
+
+  describe('unknown fallback', () => {
+    it('classifies null as UNKNOWN', () => {
+      assert.strictEqual(classifyStellarRPCFailure(null), StellarRPCFailureClass.UNKNOWN);
+    });
+
+    it('classifies plain string as UNKNOWN', () => {
+      assert.strictEqual(classifyStellarRPCFailure('some error'), StellarRPCFailureClass.UNKNOWN);
+    });
+
+    it('classifies generic Error as UNKNOWN', () => {
+      assert.strictEqual(classifyStellarRPCFailure(new Error('something')), StellarRPCFailureClass.UNKNOWN);
+    });
+
+    it('classifies object with no status as UNKNOWN', () => {
+      assert.strictEqual(classifyStellarRPCFailure({ message: 'oops' }), StellarRPCFailureClass.UNKNOWN);
+    });
+  });
+
+  // ── Security: no raw upstream strings leak ────────────────────────────────
+
+  describe('security: raw upstream strings do not leak', () => {
+    it('returns only a StellarRPCFailureClass enum value, never the raw error', () => {
+      const sensitiveErr = {
+        status: 400,
+        extras: {
+          result_codes: { transaction: 'tx_bad_seq' },
+          envelope_xdr: 'AAAA...sensitive...XDR',
+          result_xdr: 'AAAA...sensitive...result',
+        },
+      };
+      const cls = classifyStellarRPCFailure(sensitiveErr);
+      // Result must be one of the known enum values
+      assert(Object.values(StellarRPCFailureClass).includes(cls));
+      // Must not be the raw error object
+      assert.notStrictEqual(cls as any, sensitiveErr);
+    });
+  });
+});
+
+// ─── isStellarRPCRetryable ────────────────────────────────────────────────────
+
+describe('isStellarRPCRetryable', () => {
+  it('TIMEOUT is retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.TIMEOUT), true);
+  });
+
+  it('UPSTREAM_ERROR is retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.UPSTREAM_ERROR), true);
+  });
+
+  it('TX_RESULT_CODE is not retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.TX_RESULT_CODE), false);
+  });
+
+  it('OP_RESULT_CODE is not retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.OP_RESULT_CODE), false);
+  });
+
+  it('RATE_LIMIT is not retryable (caller must back off)', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.RATE_LIMIT), false);
+  });
+
+  it('UNAUTHORIZED is not retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.UNAUTHORIZED), false);
+  });
+
+  it('MALFORMED_RESPONSE is not retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.MALFORMED_RESPONSE), false);
+  });
+
+  it('UNKNOWN is not retryable', () => {
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.UNKNOWN), false);
+  });
+});
+
+// ─── Retry Storm Tests ────────────────────────────────────────────────────────
+
+describe('payout repo retry storm', () => {
+  /**
+   * Simulates a repo that fails N times then succeeds.
+   * Used to verify that callers respect retry budgets and do not storm the
+   * upstream with unbounded retries.
+   */
+  class FlakyPayoutRepo {
+    public callCount = 0;
+    constructor(private failTimes: number, private rows: Payout[]) {}
+    async listPayoutsByInvestor(investorId: string): Promise<Payout[]> {
+      this.callCount++;
+      if (this.callCount <= this.failTimes) throw new Error('transient error');
+      return this.rows.filter((p) => p.investor_id === investorId);
+    }
+  }
+
+  const PAYOUT = makePayout({ id: 'pay-r1', investor_id: 'inv-r', status: 'processed', amount: '10.00' });
+
+  it('propagates error to next() on first failure (no built-in retry in handler)', async () => {
+    // The payout handler itself does NOT retry — it delegates retry policy to
+    // the caller / middleware layer.  A single repo failure must surface as
+    // next(err), not silently swallowed.
+    const repo = new FlakyPayoutRepo(1, [PAYOUT]);
+    const handlers = createPayoutsHandlers(repo as any);
+    let capturedErr: any = null;
+    const res = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
+    assert(capturedErr instanceof Error, 'error must be forwarded to next()');
+    assert.strictEqual(repo.callCount, 1, 'handler must not retry internally');
+  });
+
+  it('does not call repo more than once per request (no storm)', async () => {
+    // Ensures the handler never issues multiple repo calls for a single HTTP
+    // request, which would amplify load during an outage.
+    const repo = new FlakyPayoutRepo(0, [PAYOUT]);
+    const handlers = createPayoutsHandlers(repo as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, next);
+    assert.strictEqual(repo.callCount, 1, 'exactly one repo call per request');
+  });
+
+  it('does not retry after a non-retryable Stellar result code error', async () => {
+    // Simulates a repo that wraps a Stellar tx_bad_seq error.
+    // The handler must not retry — tx_bad_seq is a protocol error.
+    const txErr = Object.assign(new Error('tx_bad_seq'), {
+      status: 400,
+      extras: { result_codes: { transaction: 'tx_bad_seq' } },
+    });
+    const repo = { listPayoutsByInvestor: jest.fn().mockRejectedValue(txErr) };
+    const handlers = createPayoutsHandlers(repo as any);
+    let capturedErr: any = null;
+    const res = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
+    assert(capturedErr !== null, 'error must propagate');
+    assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1, 'no retry on protocol error');
+    // Verify the error is classified as non-retryable
+    assert.strictEqual(
+      isStellarRPCRetryable(classifyStellarRPCFailure(txErr)),
+      false,
+    );
+  });
+
+  it('does not retry after a RATE_LIMIT error (429)', async () => {
+    const rateLimitErr = { status: 429, message: 'Too Many Requests' };
+    const repo = { listPayoutsByInvestor: jest.fn().mockRejectedValue(rateLimitErr) };
+    const handlers = createPayoutsHandlers(repo as any);
+    let capturedErr: any = null;
+    const res = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
+    assert(capturedErr !== null);
+    assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
+    assert.strictEqual(classifyStellarRPCFailure(rateLimitErr), StellarRPCFailureClass.RATE_LIMIT);
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.RATE_LIMIT), false);
+  });
+
+  it('classifies a timeout error as retryable but handler still does not retry', async () => {
+    // The handler itself never retries — retryability is advisory for the
+    // caller (e.g. a job queue or middleware).
+    const timeoutErr = Object.assign(new Error('Request timeout'), { name: 'AbortError' });
+    const repo = { listPayoutsByInvestor: jest.fn().mockRejectedValue(timeoutErr) };
+    const handlers = createPayoutsHandlers(repo as any);
+    let capturedErr: any = null;
+    const res = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
+    assert(capturedErr !== null);
+    assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
+    assert.strictEqual(classifyStellarRPCFailure(timeoutErr), StellarRPCFailureClass.TIMEOUT);
+    assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.TIMEOUT), true);
   });
 });

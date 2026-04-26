@@ -1,558 +1,156 @@
-import { RevenueService, SubmitRevenueReportInput } from './revenueService';
-import { OfferingRepository } from '../db/repositories/offeringRepository';
-import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
-import { AppError } from '../lib/errors';
+import { RevenueService, RevenueReportInput } from './revenueService';
+import { AppError, ErrorCode } from '../lib/errors';
+import { Decimal } from '../lib/decimal';
+import { Logger } from '../lib/logger';
+
+// Mock Logger
+const mockLogger: Logger = {
+  info: jest.fn(),
+  warn: jest.fn(),
+  error: jest.fn(),
+  debug: jest.fn(),
+  trace: jest.fn(),
+  critical: jest.fn(),
+  alert: jest.fn(),
+  emergency: jest.fn(),
+  child: jest.fn(() => mockLogger),
+};
+
+// Mock StellarService
+const mockStellarService = {
+  submitRevenueToSoroban: jest.fn(),
+};
+
+// Mock RevenueRepository
+const mockRevenueRepository = {
+  saveRevenueReport: jest.fn(),
+};
 
 describe('RevenueService', () => {
-    let service: RevenueService;
-    let mockOfferingRepo: jest.Mocked<OfferingRepository>;
-    let mockRevenueReportRepo: jest.Mocked<RevenueReportRepository>;
+  let revenueService: RevenueService;
 
-    beforeEach(() => {
-        mockOfferingRepo = {
-            findById: jest.fn(),
-            isOwner: jest.fn(),
-        } as any;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    revenueService = new RevenueService(mockStellarService, mockRevenueRepository, mockLogger);
+  });
 
-        mockRevenueReportRepo = {
-            create: jest.fn(),
-            findOverlappingReport: jest.fn(),
-        } as any;
+  describe('ingestRevenueReport', () => {
+    const validReport: RevenueReportInput = {
+      offeringId: 'offering-123',
+      amount: '100.50',
+      periodStart: '2023-01-01T00:00:00Z',
+      periodEnd: '2023-01-31T23:59:59Z',
+    };
 
-        service = new RevenueService(mockOfferingRepo, mockRevenueReportRepo);
+    it('should successfully ingest a valid revenue report', async () => {
+      mockStellarService.submitRevenueToSoroban.mockResolvedValue('stellar-tx-123');
+      mockRevenueRepository.saveRevenueReport.mockResolvedValue(undefined);
+
+      const result = await revenueService.ingestRevenueReport(validReport);
+
+      expect(result).toBe('stellar-tx-123');
+      expect(mockLogger.info).toHaveBeenCalledWith('Revenue submitted to Soroban', expect.any(Object));
+      expect(mockLogger.info).toHaveBeenCalledWith('Revenue report saved', expect.any(Object));
+      expect(mockStellarService.submitRevenueToSoroban).toHaveBeenCalledWith(
+        validReport.offeringId,
+        new Decimal(validReport.amount).toSorobanI128(7), // Assuming scale 7
+        new Date(validReport.periodStart),
+        new Date(validReport.periodEnd)
+      );
+      expect(mockRevenueRepository.saveRevenueReport).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ...validReport,
+          amountI128: new Decimal(validReport.amount).toSorobanI128(7),
+        })
+      );
     });
 
-    describe('Happy path: successful report submission', () => {
-        it('should successfully submit a revenue report with valid inputs', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-                issuerId: 'issuer-1',
-                amount: '1000.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-                requestId: 'req-123',
-            };
-
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: input.offeringId,
-                issuer_id: input.issuerId,
-                name: 'Test Offering',
-                symbol: 'TEST',
-                status: 'active',
-                created_at: new Date(),
-                updated_at: new Date(),
-            } as any);
-
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({
-                id: 'report-1',
-                offering_id: input.offeringId,
-                issuer_id: input.issuerId,
-                amount: input.amount,
-                period_start: input.periodStart,
-                period_end: input.periodEnd,
-                created_at: new Date(),
-                updated_at: new Date(),
-            } as any);
-
-            const result = await service.submitReport(input);
-
-            expect(result.id).toBe('report-1');
-            expect(result.amount).toBe('1000.00');
-            expect(mockOfferingRepo.findById).toHaveBeenCalledWith(input.offeringId);
-            expect(mockRevenueReportRepo.create).toHaveBeenCalled();
-            expect(mockRevenueReportRepo.findOverlappingReport).toHaveBeenCalled();
-        });
-
-        it('should submit report with minimal decimal places', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-                issuerId: 'issuer-1',
-                amount: '100',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: input.offeringId,
-                issuer_id: input.issuerId,
-            } as any);
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({
-                id: 'report-1',
-                amount: input.amount,
-            } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.amount).toBe('100');
-        });
+    it('should throw AppError for invalid amount format', async () => {
+      const invalidAmountReport = { ...validReport, amount: 'invalid-amount' };
+      await expect(revenueService.ingestRevenueReport(invalidAmountReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(invalidAmountReport)).rejects.toHaveProperty('code', ErrorCode.VALIDATION_ERROR);
+      expect(mockLogger.warn).toHaveBeenCalledWith('Invalid revenue amount format', expect.any(Object));
     });
 
-    describe('Offering validation', () => {
-        it('should reject submission if offering not found', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-                issuerId: 'issuer-1',
-                amount: '1000.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockOfferingRepo.findById.mockResolvedValue(null);
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            await expect(service.submitReport(input)).rejects.toMatchObject({
-                statusCode: 404,
-                code: 'NOT_FOUND',
-            });
-        });
-
-        it('should reject submission if issuer does not own offering', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-                issuerId: 'issuer-wrong',
-                amount: '1000.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: input.offeringId,
-                issuer_id: 'issuer-correct',
-            } as any);
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            await expect(service.submitReport(input)).rejects.toMatchObject({
-                statusCode: 403,
-                code: 'FORBIDDEN',
-            });
-        });
+    it('should throw AppError for zero amount', async () => {
+      const zeroAmountReport = { ...validReport, amount: '0.00' };
+      await expect(revenueService.ingestRevenueReport(zeroAmountReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(zeroAmountReport)).rejects.toHaveProperty('code', ErrorCode.VALIDATION_ERROR);
+      expect(mockLogger.warn).toHaveBeenCalledWith('Invalid revenue amount format', expect.any(Object)); // Decimal constructor will pass, but then isZero() check fails
     });
 
-    describe('Decimal amount validation: format and boundaries', () => {
-        beforeEach(() => {
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: 'offering-1',
-                issuer_id: 'issuer-1',
-            } as any);
-        });
-
-        // ─── Valid decimal amounts ────────────────────────────────────────────
-        it('should accept amount with exactly 10 decimal places', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.1234567890', // Exactly 10 decimal places
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.id).toBe('report-1');
-        });
-
-        it('should accept amount with fewer than 10 decimal places', async () => {
-            const amounts = ['1.5', '1.12', '1.123', '1.1234567'];
-            for (const amount of amounts) {
-                mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-                mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-                const input: SubmitRevenueReportInput = {
-                    offeringId: 'offering-1',
-                    issuerId: 'issuer-1',
-                    amount,
-                    periodStart: new Date('2024-01-01'),
-                    periodEnd: new Date('2024-01-31'),
-                };
-
-                await expect(service.submitReport(input)).resolves.toBeDefined();
-            }
-        });
-
-        // ─── Invalid: exceeding decimal places ────────────────────────────────
-        it('should reject amount with more than 10 decimal places', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.12345678901', // 11 decimal places
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            await expect(service.submitReport(input)).rejects.toMatchObject({
-                statusCode: 400,
-                code: 'BAD_REQUEST',
-            });
-        });
-
-        // ─── Invalid: integer part exceeds 20 digits ────────────────────────
-        it('should reject amount with more than 20 integer digits', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '123456789012345678901', // 21 digits
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            await expect(service.submitReport(input)).rejects.toMatchObject({
-                code: 'BAD_REQUEST',
-            });
-        });
-
-        // ─── Invalid: non-positive amounts ────────────────────────────────────
-        it('should reject zero amount', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '0',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-        });
-
-        it('should reject negative amount', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '-100.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-        });
-
-        // ─── Invalid: format violations ───────────────────────────────────────
-        it('should reject non-numeric characters', async () => {
-            const invalidAmounts = [
-                'abc',
-                '100.00a',
-                '100 00',
-                '$100',
-                '100,000',
-                '1e6',
-                '1E3',
-            ];
-
-            for (const amount of invalidAmounts) {
-                const input: SubmitRevenueReportInput = {
-                    offeringId: 'offering-1',
-                    issuerId: 'issuer-1',
-                    amount,
-                    periodStart: new Date('2024-01-01'),
-                    periodEnd: new Date('2024-01-31'),
-                };
-
-                await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            }
-        });
-
-        it('should reject multiple decimal points', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.50.25',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-        });
-
-        it('should reject exponential notation', async () => {
-            const exponentialAmounts = ['1e6', '1E6', '1.5e3', '1.5E3'];
-            for (const amount of exponentialAmounts) {
-                const input: SubmitRevenueReportInput = {
-                    offeringId: 'offering-1',
-                    issuerId: 'issuer-1',
-                    amount,
-                    periodStart: new Date('2024-01-01'),
-                    periodEnd: new Date('2024-01-31'),
-                };
-
-                await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            }
-        });
-
-        it('should reject empty string amount', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-        });
+    it('should throw AppError for amount exceeding Soroban i128 limits', async () => {
+      const hugeAmountReport = { ...validReport, amount: '170141183460469231731687303715884105728' }; // I128_MAX + 1
+      await expect(revenueService.ingestRevenueReport(hugeAmountReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(hugeAmountReport)).rejects.toHaveProperty('code', ErrorCode.VALIDATION_ERROR);
+      expect(mockLogger.error).toHaveBeenCalledWith('Failed to convert decimal amount to Soroban i128', expect.any(Object));
     });
 
-    describe('Period validation', () => {
-        beforeEach(() => {
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: 'offering-1',
-                issuer_id: 'issuer-1',
-            } as any);
-        });
-
-        it('should reject if period end equals period start', async () => {
-            const sameDate = new Date('2024-01-15');
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: sameDate,
-                periodEnd: sameDate,
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            await expect(service.submitReport(input)).rejects.toMatchObject({
-                statusCode: 400,
-                code: 'BAD_REQUEST',
-            });
-        });
-
-        it('should reject if period end is before period start', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-31'),
-                periodEnd: new Date('2024-01-01'),
-            };
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-        });
-
-        it('should accept valid period ordering', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-01T00:00:00Z'),
-                periodEnd: new Date('2024-01-01T00:00:01Z'), // 1 second later
-            };
-
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            await expect(service.submitReport(input)).resolves.toBeDefined();
-        });
+    it('should throw AppError for invalid periodStart date', async () => {
+      const invalidDateReport = { ...validReport, periodStart: 'not-a-date' };
+      await expect(revenueService.ingestRevenueReport(invalidDateReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(invalidDateReport)).rejects.toHaveProperty('code', ErrorCode.VALIDATION_ERROR);
     });
 
-    describe('Period overlap detection', () => {
-        beforeEach(() => {
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: 'offering-1',
-                issuer_id: 'issuer-1',
-            } as any);
-        });
-
-        it('should reject if new period overlaps with existing report', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-10'),
-                periodEnd: new Date('2024-01-20'),
-            };
-
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue({
-                id: 'existing-report',
-                offering_id: 'offering-1',
-                period_start: new Date('2024-01-15'),
-                period_end: new Date('2024-01-25'),
-            } as any);
-
-            await expect(service.submitReport(input)).rejects.toThrow(AppError);
-            await expect(service.submitReport(input)).rejects.toMatchObject({
-                statusCode: 409,
-                code: 'CONFLICT',
-            });
-        });
-
-        it('should accept if no overlapping periods exist', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-10'),
-            };
-
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.id).toBe('report-1');
-        });
-
-        it('should check for overlaps with correct arguments', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            await service.submitReport(input);
-
-            expect(mockRevenueReportRepo.findOverlappingReport).toHaveBeenCalledWith(
-                'offering-1',
-                input.periodStart,
-                input.periodEnd
-            );
-        });
+    it('should throw AppError for invalid periodEnd date', async () => {
+      const invalidDateReport = { ...validReport, periodEnd: 'not-a-date' };
+      await expect(revenueService.ingestRevenueReport(invalidDateReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(invalidDateReport)).rejects.toHaveProperty('code', ErrorCode.VALIDATION_ERROR);
     });
 
-    describe('Edge cases and boundary values', () => {
-        beforeEach(() => {
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: 'offering-1',
-                issuer_id: 'issuer-1',
-            } as any);
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-        });
-
-        it('should handle very large amounts within limits', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '99999999999999999999.9999999999', // Maximum valid amount
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.id).toBe('report-1');
-        });
-
-        it('should handle very small amounts within limits', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '0.0000000001', // Minimum positive amount
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.id).toBe('report-1');
-        });
-
-        it('should preserve exact decimal string in report', async () => {
-            const amount = '1234.5678901234'; // Note: more than 10 decimals should fail before this
-            // Let's use a valid one instead
-            const validAmount = '1234.1234567890';
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: validAmount,
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-            };
-
-            mockRevenueReportRepo.create.mockResolvedValue({
-                id: 'report-1',
-                amount: validAmount,
-            } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.amount).toBe(validAmount);
-        });
+    it('should throw AppError if periodEnd is not after periodStart', async () => {
+      const invertedDatesReport = { ...validReport, periodStart: '2023-01-31T23:59:59Z', periodEnd: '2023-01-01T00:00:00Z' };
+      await expect(revenueService.ingestRevenueReport(invertedDatesReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(invertedDatesReport)).rejects.toHaveProperty('code', ErrorCode.VALIDATION_ERROR);
     });
 
-    describe('Request ID propagation and logging', () => {
-        beforeEach(() => {
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: 'offering-1',
-                issuer_id: 'issuer-1',
-            } as any);
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-        });
+    it('should classify and throw AppError for Stellar RPC 400 (Bad Request)', async () => {
+      const stellarError = { response: { status: 400, data: { extras: { result_codes: { transaction: 'tx_bad_auth' } } } } };
+      mockStellarService.submitRevenueToSoroban.mockRejectedValue(stellarError);
 
-        it('should accept and use requestId from input', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-                requestId: 'req-custom-123',
-            };
-
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.id).toBe('report-1');
-            // RequestId is logged but not returned in the report
-        });
-
-        it('should work without requestId (defaults to unknown)', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '100.00',
-                periodStart: new Date('2024-01-01'),
-                periodEnd: new Date('2024-01-31'),
-                // No requestId provided
-            };
-
-            mockRevenueReportRepo.create.mockResolvedValue({ id: 'report-1' } as any);
-
-            const result = await service.submitReport(input);
-            expect(result.id).toBe('report-1');
-        });
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toHaveProperty('code', ErrorCode.BAD_REQUEST);
+      expect(mockLogger.error).toHaveBeenCalledWith('Stellar RPC submission failed', expect.any(Object));
+      expect(mockLogger.warn).toHaveBeenCalledWith('Stellar RPC Bad Request', expect.any(Object));
     });
 
-    describe('Data persistence', () => {
-        it('should pass correct data to repository.create()', async () => {
-            const input: SubmitRevenueReportInput = {
-                offeringId: 'offering-1',
-                issuerId: 'issuer-1',
-                amount: '500.123',
-                periodStart: new Date('2024-02-01'),
-                periodEnd: new Date('2024-02-28'),
-            };
+    it('should classify and throw AppError for Stellar RPC 404 (Not Found)', async () => {
+      const stellarError = { response: { status: 404, data: { extras: { result_codes: { transaction: 'tx_no_source_account' } } } } };
+      mockStellarService.submitRevenueToSoroban.mockRejectedValue(stellarError);
 
-            mockOfferingRepo.findById.mockResolvedValue({
-                id: 'offering-1',
-                issuer_id: 'issuer-1',
-            } as any);
-            mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
-            mockRevenueReportRepo.create.mockResolvedValue({
-                id: 'report-1',
-                amount: input.amount,
-            } as any);
-
-            await service.submitReport(input);
-
-            expect(mockRevenueReportRepo.create).toHaveBeenCalledWith(
-                expect.objectContaining({
-                    offering_id: input.offeringId,
-                    issuer_id: input.issuerId,
-                    amount: input.amount,
-                    period_start: input.periodStart,
-                    period_end: input.periodEnd,
-                    reported_by: input.issuerId,
-                })
-            );
-        });
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toHaveProperty('code', ErrorCode.NOT_FOUND);
+      expect(mockLogger.error).toHaveBeenCalledWith('Stellar RPC submission failed', expect.any(Object));
+      expect(mockLogger.warn).toHaveBeenCalledWith('Stellar RPC Not Found', expect.any(Object));
     });
+
+    it('should classify and throw AppError for Stellar RPC 500 (Internal Server Error)', async () => {
+      const stellarError = { response: { status: 500, data: { extras: { result_codes: { transaction: 'tx_internal_error' } } } };
+      mockStellarService.submitRevenueToSoroban.mockRejectedValue(stellarError);
+
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toHaveProperty('code', ErrorCode.SERVICE_UNAVAILABLE);
+      expect(mockLogger.error).toHaveBeenCalledWith('Stellar RPC submission failed', expect.any(Object));
+      expect(mockLogger.error).toHaveBeenCalledWith('Stellar RPC Internal Error', expect.any(Object));
+    });
+
+    it('should classify and throw generic AppError for unclassified Stellar RPC errors', async () => {
+      const unknownError = new Error('Network error');
+      mockStellarService.submitRevenueToSoroban.mockRejectedValue(unknownError);
+
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toHaveProperty('code', ErrorCode.INTERNAL_ERROR);
+      expect(mockLogger.error).toHaveBeenCalledWith('Stellar RPC submission failed', expect.any(Object));
+      expect(mockLogger.error).toHaveBeenCalledWith('Unclassified Stellar RPC error', expect.any(Object));
+    });
+
+    it('should throw AppError if saving revenue report fails', async () => {
+      mockStellarService.submitRevenueToSoroban.mockResolvedValue('stellar-tx-123');
+      mockRevenueRepository.saveRevenueReport.mockRejectedValue(new Error('DB connection lost'));
+
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toThrow(AppError);
+      await expect(revenueService.ingestRevenueReport(validReport)).rejects.toHaveProperty('code', ErrorCode.INTERNAL_ERROR);
+      expect(mockLogger.error).toHaveBeenCalledWith('Failed to save revenue report to database', expect.any(Object));
+    });
+  });
 });

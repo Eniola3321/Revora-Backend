@@ -10,6 +10,7 @@ export const ErrorCode = {
   CONFLICT: 'CONFLICT',
   SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  TOO_MANY_REQUESTS: 'TOO_MANY_REQUESTS',
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -23,75 +24,30 @@ export interface ErrorResponse {
 }
 
 /**
- * Structured application error.
- *
- * Only instances of this class are allowed to control client-visible status
- * codes, messages, and optional details. Unknown thrown values are sanitized by
- * the global error handler.
+ * Base class for all application-specific errors.
+ * Provides a consistent structure for error handling, including HTTP status codes.
  */
 export class AppError extends Error {
-  readonly code: ErrorCode;
-  readonly statusCode: number;
-  readonly details?: unknown;
-  readonly expose: boolean;
+  public readonly name: string;
+  public readonly httpCode: number;
+  public readonly isOperational: boolean;
 
-  constructor(
-    code: ErrorCode,
-    message: string,
-    statusCode: number,
-    details?: unknown,
-    options?: { expose?: boolean },
-  ) {
+  constructor(name: string, httpCode: number, message: string, isOperational: boolean = true) {
     super(message);
-    this.name = 'AppError';
-    this.code = code;
-    this.statusCode = statusCode;
-    this.details = details;
-    this.expose = options?.expose ?? true;
-    Object.setPrototypeOf(this, AppError.prototype);
-  }
-
-  toResponse(requestId?: string): ErrorResponse {
-    const body: ErrorResponse = {
-      code: this.code,
-      message: this.message,
-    };
-
-    if (this.details !== undefined) {
-      body.details = this.details;
-    }
-
-    if (requestId !== undefined) {
-      body.requestId = requestId;
-    }
-
-    return body;
+    Object.setPrototypeOf(this, new.target.prototype); // Restore prototype chain
+    this.name = name;
+    this.httpCode = httpCode;
+    this.isOperational = isOperational;
+    Error.captureStackTrace(this, this.constructor);
   }
 }
 
-/**
- * Thrown when a database unique constraint is violated.
- * Used by repositories to map PostgreSQL 23505 errors into domain-friendly errors.
- */
-export class UniqueConstraintError extends Error {
-  readonly field: string;
-
-  constructor(field: string, message?: string) {
-    super(message ?? `Duplicate value for field: ${field}`);
-    this.name = 'UniqueConstraintError';
-    this.field = field;
-    Object.setPrototypeOf(this, UniqueConstraintError.prototype);
-  }
+export class NotFoundError extends AppError {
+  constructor(message: string = 'Not Found') { super('NotFoundError', 404, message); }
 }
 
-export function createError(
-  code: ErrorCode,
-  message: string,
-  statusCode: number,
-  details?: unknown,
-  options?: { expose?: boolean },
-): AppError {
-  return new AppError(code, message, statusCode, details, options);
+export class UnauthorizedError extends AppError {
+  constructor(message: string = 'Unauthorized') { super('UnauthorizedError', 401, message); }
 }
 
 /** Convenience factories for common error scenarios. */
@@ -129,6 +85,9 @@ export const Errors = {
       { expose: false },
     );
   },
+
+  tooManyRequests: (message = 'Too many requests', details?: unknown): AppError =>
+    createError(ErrorCode.TOO_MANY_REQUESTS, message, 429, details),
 };
 
 export function throwError(
@@ -141,6 +100,6 @@ export function throwError(
   throw createError(code, message, statusCode, details, options);
 }
 
-export function sendAppError(next: NextFunction, error: AppError): void {
-  next(error);
+export class BadRequestError extends AppError {
+  constructor(message: string = 'Bad Request') { super('BadRequestError', 400, message); }
 }
