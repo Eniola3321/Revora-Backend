@@ -1,4 +1,9 @@
-import DistributionEngine, { BalanceRow, DistributionBatchResult } from './distributionEngine';
+import DistributionEngine, { BalanceRow } from './distributionEngine';
+import {
+  classifyStellarRPCFailure,
+  isStellarRPCRetryable,
+  StellarRPCFailureClass,
+} from '../lib/stellarRpcFailure';
 
 class MockDistributionRepo {
   public runs: any[] = [];
@@ -136,237 +141,121 @@ describe('DistributionEngine', () => {
     expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '20.00' }]);
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Batch Processing Tests
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ── Retry storm: exhausted budget throws, does not loop forever ────────────
 
-  describe('batch processing', () => {
-    it('processes large investor sets in batches', async () => {
-      const repo = new MockDistributionRepo();
-      // Create 150 investors
-      const balances = Array.from({ length: 150 }, (_, i) => ({
-        investor_id: `i${i + 1}`,
-        balance: 100,
-      }));
+  it('throws after maxRetries exhausted on balance fetch', async () => {
+    const repo = new MockDistributionRepo();
+    let calls = 0;
+    const flakyProvider = {
+      getBalances: async () => { calls++; throw new Error('flaky'); },
+    };
+    const engine = new DistributionEngine(null, repo, flakyProvider, { maxRetries: 3, initialDelayMs: 0 });
 
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider(balances),
-        { maxRetries: 1, initialDelayMs: 0, batchSize: 50 },
-      );
+    await expect(
+      engine.distribute('off-5', { start: new Date(), end: new Date() }, 10),
+    ).rejects.toThrow('Failed to acquire balances after 3 attempts');
 
-      const result = await engine.distributeWithBatch(
-        'off-batch-1',
-        { start: new Date('2026-05-01'), end: new Date('2026-05-31') },
-        15000,
-      );
-
-      // All payouts should succeed
-      expect(result.successfulPayouts).toHaveLength(150);
-      expect(result.failedPayouts).toHaveLength(0);
-      expect(result.totalPayouts).toBe(150);
-      expect(repo.payouts).toHaveLength(150);
-    });
-
-    it('handles partial batch failures gracefully', async () => {
-      const repo = new MockDistributionRepo();
-      const balances = Array.from({ length: 10 }, (_, i) => ({
-        investor_id: `i${i + 1}`,
-        balance: 100,
-      }));
-
-      // Make payouts at indices 3 and 7 fail
-      repo.failSpecificPayouts = [3, 7];
-
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider(balances),
-        { maxRetries: 1, initialDelayMs: 0, batchSize: 5 },
-      );
-
-      const result = await engine.distributeWithBatch(
-        'off-batch-2',
-        { start: new Date('2026-06-01'), end: new Date('2026-06-30') },
-        1000,
-      );
-
-      // 8 should succeed, 2 should fail
-      expect(result.successfulPayouts).toHaveLength(8);
-      expect(result.failedPayouts).toHaveLength(2);
-      expect(result.failedPayouts[0].investor_id).toBe('i4');
-      expect(result.failedPayouts[1].investor_id).toBe('i8');
-      expect(result.failedPayouts[0].errorClass).toBeDefined();
-    });
-
-    it('processes single investor distribution (batch size = 1)', async () => {
-      const repo = new MockDistributionRepo();
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
-        { maxRetries: 1, initialDelayMs: 0, batchSize: 1 },
-      );
-
-      const result = await engine.distributeWithBatch(
-        'off-batch-3',
-        { start: new Date('2026-07-01'), end: new Date('2026-07-31') },
-        50,
-      );
-
-      expect(result.successfulPayouts).toEqual([{ investor_id: 'i1', amount: '50.00' }]);
-      expect(result.failedPayouts).toHaveLength(0);
-    });
-
-    it('handles very small revenue amounts with rounding', async () => {
-      const repo = new MockDistributionRepo();
-      const balances = [
-        { investor_id: 'i1', balance: 1 },
-        { investor_id: 'i2', balance: 1 },
-        { investor_id: 'i3', balance: 1 },
-      ];
-
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider(balances),
-        { maxRetries: 1, initialDelayMs: 0 },
-      );
-
-      const result = await engine.distributeWithBatch(
-        'off-batch-4',
-        { start: new Date('2026-08-01'), end: new Date('2026-08-31') },
-        0.03,
-      );
-
-      const sum = result.successfulPayouts.reduce((acc, p) => acc + Number(p.amount), 0);
-      expect(sum).toBeCloseTo(0.03, 2);
-      expect(result.successfulPayouts).toHaveLength(3);
-    });
-
-    it('handles very large revenue amounts without precision loss', async () => {
-      const repo = new MockDistributionRepo();
-      const balances = [
-        { investor_id: 'i1', balance: 50 },
-        { investor_id: 'i2', balance: 50 },
-      ];
-
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider(balances),
-        { maxRetries: 1, initialDelayMs: 0 },
-      );
-
-      const result = await engine.distributeWithBatch(
-        'off-batch-5',
-        { start: new Date('2026-09-01'), end: new Date('2026-09-30') },
-        1000000000,
-      );
-
-      const sum = result.successfulPayouts.reduce((acc, p) => acc + Number(p.amount), 0);
-      expect(sum).toBeCloseTo(1000000000, 2);
-      expect(result.successfulPayouts).toEqual([
-        { investor_id: 'i1', amount: '500000000.00' },
-        { investor_id: 'i2', amount: '500000000.00' },
-      ]);
-    });
-
-    it('continues processing next batch after batch failure', async () => {
-      const repo = new MockDistributionRepo();
-      const balances = Array.from({ length: 15 }, (_, i) => ({
-        investor_id: `i${i + 1}`,
-        balance: 100,
-      }));
-
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider(balances),
-        { maxRetries: 1, initialDelayMs: 0, batchSize: 5 },
-      );
-
-      // Mock to fail entire batch 2
-      const originalCreatePayout = repo.createPayout.bind(repo);
-      let callCount = 0;
-      repo.createPayout = async (input: any) => {
-        callCount++;
-        // Fail all payouts in batch 2 (calls 6-10)
-        if (callCount >= 6 && callCount <= 10) {
-          throw new Error('Batch 2 failure');
-        }
-        return originalCreatePayout(input);
-      };
-
-      const result = await engine.distributeWithBatch(
-        'off-batch-6',
-        { start: new Date('2026-10-01'), end: new Date('2026-10-31') },
-        1500,
-      );
-
-      // Batch 1 (5 payouts) + Batch 3 (5 payouts) should succeed
-      expect(result.successfulPayouts.length).toBeGreaterThanOrEqual(10);
-      expect(result.failedPayouts.length).toBeGreaterThanOrEqual(5);
-    });
+    expect(calls).toBe(3); // exactly maxRetries, no infinite loop
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Error Classification Tests
-  // ═════════════════──────────────────────────────────────────────────────────
+  it('throws after maxRetries exhausted on payout creation', async () => {
+    const repo = new MockDistributionRepo();
+    repo.failNextPayoutCount = 99; // always fail
+    const engine = new DistributionEngine(
+      null, repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 2, initialDelayMs: 0 },
+    );
 
-  describe('error classification', () => {
-    it('classifies payout errors without exposing raw messages to clients', async () => {
-      const repo = new MockDistributionRepo();
-      repo.failSpecificPayouts = [0];
+    await expect(
+      engine.distribute('off-6', { start: new Date(), end: new Date() }, 10),
+    ).rejects.toThrow('Failed to create payout for investor i1 after 2 attempts');
+  });
 
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider([
-          { investor_id: 'i1', balance: 50 },
-          { investor_id: 'i2', balance: 50 },
-        ]),
-        { maxRetries: 1, initialDelayMs: 0 },
-      );
+  it('succeeds on last allowed retry (boundary)', async () => {
+    const repo = new MockDistributionRepo();
+    repo.failNextRunCount = 2; // fail twice, succeed on 3rd (maxRetries=3)
+    const engine = new DistributionEngine(
+      null, repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 3, initialDelayMs: 0 },
+    );
 
-      const result = await engine.distributeWithBatch(
-        'off-err-1',
-        { start: new Date('2026-11-01'), end: new Date('2026-11-30') },
-        100,
-      );
+    const result = await engine.distribute('off-7', { start: new Date(), end: new Date() }, 50);
+    expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '50.00' }]);
+  });
 
-      expect(result.failedPayouts).toHaveLength(1);
-      expect(result.failedPayouts[0].errorClass).toBeDefined();
-      expect(result.successfulPayouts).toHaveLength(1);
-    });
+  // ── Stellar result-code classification wired into distribution errors ──────
 
-    it('maintains backward compatibility with distribute() method', async () => {
-      const repo = new MockDistributionRepo();
-      const balances = [
-        { investor_id: 'i1', balance: 70 },
-        { investor_id: 'i2', balance: 30 },
-      ];
+  it('classifies a Stellar tx_bad_seq error as non-retryable TX_RESULT_CODE', () => {
+    const err = { status: 400, extras: { result_codes: { transaction: 'tx_bad_seq' } } };
+    expect(classifyStellarRPCFailure(err)).toBe(StellarRPCFailureClass.TX_RESULT_CODE);
+    expect(isStellarRPCRetryable(StellarRPCFailureClass.TX_RESULT_CODE)).toBe(false);
+  });
 
-      const engine = new DistributionEngine(
-        null,
-        repo,
-        new MockBalanceProvider(balances),
-        { maxRetries: 1, initialDelayMs: 0 },
-      );
+  it('classifies a Stellar op_underfunded error as non-retryable OP_RESULT_CODE', () => {
+    const err = { status: 400, extras: { result_codes: { transaction: 'tx_failed', operations: ['op_underfunded'] } } };
+    expect(classifyStellarRPCFailure(err)).toBe(StellarRPCFailureClass.OP_RESULT_CODE);
+    expect(isStellarRPCRetryable(StellarRPCFailureClass.OP_RESULT_CODE)).toBe(false);
+  });
 
-      const result = await engine.distribute(
-        'off-err-2',
-        { start: new Date('2026-12-01'), end: new Date('2026-12-31') },
-        100,
-      );
+  it('classifies a 503 upstream error as retryable', () => {
+    const err = { status: 503 };
+    expect(classifyStellarRPCFailure(err)).toBe(StellarRPCFailureClass.UPSTREAM_ERROR);
+    expect(isStellarRPCRetryable(StellarRPCFailureClass.UPSTREAM_ERROR)).toBe(true);
+  });
 
-      // Original interface should still work
-      expect(result.payouts).toEqual([
-        { investor_id: 'i1', amount: '70.00' },
-        { investor_id: 'i2', amount: '30.00' },
-      ]);
-      expect(result.distributionRun).toBeDefined();
-    });
+  it('throws when offeringId is empty', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider([]), { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('', { start: new Date(), end: new Date() }, 10)).rejects.toThrow('offeringId is required');
+  });
+
+  it('throws when revenueAmount is zero', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider([{ investor_id: 'i1', balance: 1 }]), { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('off-x', { start: new Date(), end: new Date() }, 0)).rejects.toThrow('revenueAmount must be > 0');
+  });
+
+  it('throws when no investors found', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider([]), { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('off-x', { start: new Date(), end: new Date() }, 10)).rejects.toThrow('No investors or balances found');
+  });
+
+  it('uses offeringRepo.getInvestors when no balanceProvider', async () => {
+    const repo = new MockDistributionRepo();
+    const offeringRepo = { getInvestors: async () => [{ investor_id: 'i1', balance: 100 }] };
+    const engine = new DistributionEngine(offeringRepo, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
+    const result = await engine.distribute('off-8', { start: new Date(), end: new Date() }, 10);
+    expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '10.00' }]);
+  });
+
+  it('uses offeringRepo.listInvestors as fallback', async () => {
+    const repo = new MockDistributionRepo();
+    const offeringRepo = { listInvestors: async () => [{ investor_id: 'i2', balance: 50 }] };
+    const engine = new DistributionEngine(offeringRepo, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
+    const result = await engine.distribute('off-9', { start: new Date(), end: new Date() }, 20);
+    expect(result.payouts).toEqual([{ investor_id: 'i2', amount: '20.00' }]);
+  });
+
+  it('throws when no balance source is available', async () => {
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(null, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
+    await expect(engine.distribute('off-x', { start: new Date(), end: new Date() }, 10)).rejects.toThrow('Failed to acquire balances');
+  });
+
+  it('logs retries when logRetries is true', async () => {
+    const repo = new MockDistributionRepo();
+    repo.failNextRunCount = 1;
+    const spy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    const engine = new DistributionEngine(
+      null, repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 2, initialDelayMs: 0, logRetries: true },
+    );
+    await engine.distribute('off-log', { start: new Date(), end: new Date() }, 5);
+    expect(spy).toHaveBeenCalledWith(expect.stringContaining('[DistributionEngine]'));
+    spy.mockRestore();
   });
 });

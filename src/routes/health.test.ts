@@ -9,6 +9,7 @@ import {
 } from '../index';
 import { closePool } from '../db/client';
 import { ErrorCode } from '../lib/errors';
+import { MetricsCollector } from '../lib/metrics';
 import {
   createHealthRouter,
   healthReadyHandler,
@@ -445,6 +446,115 @@ describe('WebhookQueue', () => {
     await expect(
       WebhookQueue.processDelivery('http://192.168.1.10/internal', { event: 'test' }),
     ).resolves.toBe(false);
+  });
+});
+
+describe('health metrics collection', () => {
+  let metrics: MetricsCollector;
+
+  beforeEach(() => {
+    metrics = new MetricsCollector({ enabled: true });
+  });
+
+  afterEach(() => {
+    metrics.reset();
+  });
+
+  it('should record successful health check metrics', async () => {
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db, metrics));
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const mapped = err as { statusCode: number; toResponse: () => unknown };
+      res.status(mapped.statusCode).json(mapped.toResponse());
+    });
+
+    await request(app).get('/ready');
+
+    const snapshot = await metrics.getSnapshot();
+    expect(snapshot.custom.length).toBeGreaterThan(0);
+    
+    // Check for health check metrics
+    const dbSuccess = snapshot.custom.find(m => 
+      m.name === 'health_checks_total' && 
+      m.labels?.check === 'database' && 
+      m.labels?.status === 'success'
+    );
+    expect(dbSuccess?.value).toBe(1);
+
+    const stellarSuccess = snapshot.custom.find(m => 
+      m.name === 'health_checks_total' && 
+      m.labels?.check === 'stellar-horizon' && 
+      m.labels?.status === 'success'
+    );
+    expect(stellarSuccess?.value).toBe(1);
+  });
+
+  it('should record failed health check metrics', async () => {
+    const db = {
+      query: jest.fn().mockRejectedValue(new Error('connection failed')),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db, metrics));
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const mapped = err as { statusCode: number; toResponse: () => unknown };
+      res.status(mapped.statusCode).json(mapped.toResponse());
+    });
+
+    await request(app).get('/ready');
+
+    const snapshot = await metrics.getSnapshot();
+    const dbFailure = snapshot.custom.find(m => 
+      m.name === 'health_checks_total' && 
+      m.labels?.check === 'database' && 
+      m.labels?.status === 'failure'
+    );
+    expect(dbFailure?.value).toBe(1);
+  });
+
+  it('should record health check duration', async () => {
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db, metrics));
+
+    await request(app).get('/ready');
+
+    const snapshot = await metrics.getSnapshot();
+    const durationMetric = snapshot.custom.find(m => 
+      m.name === 'health_check_duration_ms' && 
+      m.labels?.endpoint === 'ready'
+    );
+    expect(durationMetric).toBeDefined();
+    expect(durationMetric?.value).toBeGreaterThan(0);
+  });
+
+  it('should work without metrics collector', async () => {
+    const db = {
+      query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }),
+    };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get('/ready', healthReadyHandler(db)); // No metrics
+
+    const response = await request(app).get('/ready');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      status: 'ok',
+      db: 'up',
+      stellar: 'up',
+    });
   });
 });
 
