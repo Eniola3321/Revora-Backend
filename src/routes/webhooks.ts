@@ -60,10 +60,11 @@ const defaultEventHandler: WebhookEventHandler = async (event: WebhookEvent) => 
     eventTimestamp: event.timestamp,
   });
 
-  return {
-    success: true,
-    eventId: event.id,
-    message: `Event ${event.event} processed successfully`,
+    return {
+      success: true,
+      eventId: event.id,
+      message: `Event ${event.event} processed successfully`,
+    };
   };
 };
 
@@ -89,6 +90,8 @@ export interface WebhookRouterConfig {
   clockSkewMs?: number;
   /** Custom webhook endpoint path (default: '/webhooks') */
   path?: string;
+  /** Logger instance for structured logging */
+  logger?: Logger;
 }
 
 /**
@@ -160,13 +163,13 @@ function validateWebhookEvent(body: unknown): { valid: boolean; error?: string; 
 export function createWebhookRouter(config: WebhookRouterConfig): Router {
   const {
     secret,
-    eventHandler = defaultEventHandler,
     requireTimestamp = true,
     maxAgeMs = 5 * 60 * 1000, // 5 minutes
     maxPayloadSize = 1024 * 1024, // 1MB
     clockSkewMs = 30 * 1000, // 30 seconds clock drift tolerance
   } = config;
 
+  const eventHandler = config.eventHandler ?? createDefaultEventHandler(logger);
   const router = Router();
 
   // Apply raw body parser for signature verification
@@ -239,10 +242,16 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
       }
     },
     async (req: Request, res: Response): Promise<void> => {
+      const requestId = req.headers['x-request-id'] as string | undefined;
+      
       try {
         // Validate event structure
         const validation = validateWebhookEvent(req.body);
         if (!validation.valid) {
+          logger.warn('Invalid webhook event structure', {
+            requestId,
+            validationError: validation.error,
+          });
           res.status(400).json({
             success: false,
             error: 'Invalid webhook event structure',
@@ -254,10 +263,21 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
         const event = validation.event!;
         const authReq = req as WebhookAuthenticatedRequest;
 
+        logger.info('Processing webhook event', {
+          requestId,
+          eventId: event.id,
+          eventType: event.event,
+        });
+
         // Process the event
         const result = await eventHandler(event);
 
         if (result.success) {
+          logger.info('Webhook event processed successfully', {
+            requestId,
+            eventId: event.id,
+            eventType: event.event,
+          });
           res.status(200).json({
             success: true,
             eventId: result.eventId || event.id,
@@ -266,6 +286,12 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
             verifiedAt: authReq.webhook?.timestamp?.toISOString(),
           });
         } else {
+          logger.warn('Webhook event processing failed', {
+            requestId,
+            eventId: event.id,
+            eventType: event.event,
+            message: result.message,
+          });
           res.status(422).json({
             success: false,
             eventId: event.id,
