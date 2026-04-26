@@ -18,12 +18,18 @@ jest.mock('@stellar/stellar-sdk', () => {
     rpc: {
       Server: jest.fn().mockImplementation(() => ({
         getAccount: jest.fn().mockResolvedValue({
+          accountId: () => 'G-MOCK-PUBLIC-KEY',
           sequenceNumber: () => '1',
           incrementSequenceNumber: jest.fn(),
         }),
         sendTransaction: jest
           .fn()
-          .mockResolvedValue({ hash: 'mock-hash', status: 'SUCCESS' }),
+          .mockResolvedValue({ 
+            hash: 'mock-hash', 
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          }),
       })),
     },
     Keypair: {
@@ -41,11 +47,11 @@ jest.mock('@stellar/stellar-sdk', () => {
     TransactionBuilder: jest.fn().mockImplementation(() => ({
       addOperation: jest.fn().mockReturnThis(),
       setTimeout: jest.fn().mockReturnThis(),
-      build: jest.fn().mockReturnThis(),
-      sign: jest.fn(),
+      build: jest.fn().mockReturnValue(mockTransaction),
     })),
     Operation: {
       payment: jest.fn(),
+      invokeContractFunction: jest.fn(),
     },
     BASE_FEE: '100',
     Networks: {
@@ -55,14 +61,28 @@ jest.mock('@stellar/stellar-sdk', () => {
   };
 });
 
+// Mock environment
+jest.mock('../config/env', () => ({
+  env: {
+    STELLAR_NETWORK: 'testnet',
+    STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+  },
+}));
+
 describe('StellarSubmissionService', () => {
   let service: StellarSubmissionService;
+  let mockServer: jest.Mocked<StellarSdk.rpc.Server>;
   const mockSecret = 'SAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
 
   beforeEach(() => {
     process.env.STELLAR_SERVER_SECRET = mockSecret;
     jest.clearAllMocks();
     service = new StellarSubmissionService();
+    mockServer = (StellarSdk.rpc.Server as jest.Mock).mock.results[0].value;
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('should initialize with the correct horizon URL and keypair', () => {
@@ -94,7 +114,7 @@ describe('StellarSubmissionService', () => {
 
     const result = await service.submitPayment(to, amount);
 
-    expect(result).toEqual({ hash: 'mock-hash', status: 'SUCCESS' });
+    expect(result).toEqual({ hash: 'mock-hash', status: 'PENDING' });
     expect(StellarSdk.Operation.payment).toHaveBeenCalledWith({
       destination: to,
       amount,
