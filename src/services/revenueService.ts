@@ -5,7 +5,8 @@ import {
     RevenueReport,
 } from '../db/repositories/revenueReportRepository';
 import { Errors } from '../lib/errors';
-import { globalLogger } from '../lib/logger';
+import { Logger } from '../lib/logger';
+import { LogLevel } from '../lib/logger';
 
 export interface SubmitRevenueReportInput {
     offeringId: string;
@@ -81,20 +82,39 @@ export class RevenueService {
         if (offering.issuer_id !== input.issuerId) {
             throw Errors.forbidden(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
         }
-    }
 
         // 2. Validate amount format and value
-        const amountRegex = /^\d+(\.\d{1,10})?$/;
-        if (!amountRegex.test(input.amount)) {
-            throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
+        const amountStr = input.amount;
+        const amountRegex = /^\d+(\.\d+)?$/;
+        if (!amountRegex.test(amountStr)) {
+            throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string');
         }
 
-        const amountNum = parseFloat(input.amount);
-        if (amountNum <= 0) {
-            throw Errors.validationError('Invalid revenue amount: must be greater than zero');
+        const [integerPart, fractionalPart = ''] = amountStr.split('.');
+
+        if (integerPart.length > DECIMAL_LIMITS.MAX_INTEGER_DIGITS) {
+            throw Errors.validationError(`Amount exceeds maximum integer digits of ${DECIMAL_LIMITS.MAX_INTEGER_DIGITS}`);
         }
 
-        // 3. Validate period logic
+        if (fractionalPart.length > DECIMAL_LIMITS.MAX_DECIMAL_PLACES) {
+            throw Errors.validationError(`Decimal places exceed maximum ${DECIMAL_LIMITS.MAX_DECIMAL_PLACES} places`);
+        }
+
+        const numValue = parseFloat(amountStr);
+        if (!Number.isFinite(numValue) || numValue <= 0) {
+            throw Errors.validationError('Amount must be a positive number greater than zero');
+        }
+
+        const maxNum = parseFloat(DECIMAL_LIMITS.MAX_AMOUNT);
+        if (numValue > maxNum) {
+            throw Errors.validationError(`Amount exceeds maximum allowed value of ${DECIMAL_LIMITS.MAX_AMOUNT}`);
+        }
+
+        // 3. Validate period dates
+        if (isNaN(input.periodStart.getTime()) || isNaN(input.periodEnd.getTime())) {
+            throw Errors.validationError('Invalid date format for periodStart or periodEnd. Must be ISO 8601.');
+        }
+
         if (input.periodEnd <= input.periodStart) {
             throw Errors.validationError('Invalid period: end date must be strictly after start date');
         }
@@ -105,70 +125,6 @@ export class RevenueService {
             input.periodStart,
             input.periodEnd
         );
-      }
-    } catch (error) {
-      this.logger.warn('Invalid revenue amount format', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
-      if (error instanceof AppError) throw error;
-      throw new AppError(
-        ErrorCode.VALIDATION_ERROR,
-        `Invalid revenue amount: ${amount}`,
-        400,
-        { field: 'amount', value: amount }
-      );
-    }
-
-    // 2. Validate period dates
-    const startDate = new Date(periodStart);
-    const endDate = new Date(periodEnd);
-
-    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-      throw new AppError(
-        ErrorCode.VALIDATION_ERROR,
-        'Invalid date format for periodStart or periodEnd. Must be ISO 8601.',
-        400,
-        { periodStart, periodEnd }
-      );
-    }
-
-    if (startDate >= endDate) {
-      throw new AppError(
-        ErrorCode.VALIDATION_ERROR,
-        'periodEnd must be after periodStart.',
-        400,
-        { periodStart, periodEnd }
-      );
-    }
-
-    // 3. Convert amount to Soroban i128 scaled BigInt
-    let amountI128: BigInt;
-    try {
-      amountI128 = decimalAmount.toSorobanI128(SOROBAN_I128_SCALE);
-    } catch (error) {
-      this.logger.error('Failed to convert decimal amount to Soroban i128', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
-      if (error instanceof AppError) throw error;
-      throw new AppError(
-        ErrorCode.INTERNAL_ERROR,
-        'Failed to process revenue amount for Soroban.',
-        500,
-        { offeringId, amount }
-      );
-    }
-
-    // 4. Submit to Stellar/Soroban
-    let transactionId: string;
-    try {
-      transactionId = await this.stellarService.submitRevenueToSoroban(
-        offeringId,
-        amountI128,
-        startDate,
-        endDate
-      );
-      this.logger.info('Revenue submitted to Soroban', { offeringId, amount, amountI128: amountI128.toString(), transactionId });
-    } catch (error) {
-      this.logger.error('Stellar RPC submission failed', { offeringId, amount, error: error instanceof Error ? error.message : String(error) });
-      // Use a utility to classify Stellar RPC failures into AppErrors
-      throw this.classifyStellarRPCFailure(error);
-    }
 
         if (overlapping) {
             throw Errors.conflict(
@@ -176,46 +132,24 @@ export class RevenueService {
             );
         }
 
-        // ─── Check fractional part length ────────────────────────────────────────
-        if (fractionalPart.length > DECIMAL_LIMITS.MAX_DECIMAL_PLACES) {
-            return {
-                valid: false,
-                reason: `Decimal places exceed maximum ${DECIMAL_LIMITS.MAX_DECIMAL_PLACES} places`,
-                details: {
-                    provided: fractionalPart.length,
-                    maximum: DECIMAL_LIMITS.MAX_DECIMAL_PLACES,
-                    providedValue: amount,
-                },
-            };
-        }
+        // 5. Save the report
+        const reportData: CreateRevenueReportInput = {
+            offering_id: input.offeringId,
+            amount: input.amount,
+            period_start: input.periodStart,
+            period_end: input.periodEnd,
+        };
 
-        // ─── Check numeric value > 0 ────────────────────────────────────────────
-        const numValue = parseFloat(amount);
-        if (!Number.isFinite(numValue) || numValue <= 0) {
-            return {
-                valid: false,
-                reason: 'Amount must be a positive number greater than zero',
-                details: { providedValue: amount },
-            };
-        }
+        const report = await this.revenueReportRepo.create(reportData);
 
-        // ─── Check against explicit maximum ─────────────────────────────────────
-        const maxNum = parseFloat(DECIMAL_LIMITS.MAX_AMOUNT);
-        if (numValue > maxNum) {
-            return {
-                valid: false,
-                reason: `Amount exceeds maximum allowed value of ${DECIMAL_LIMITS.MAX_AMOUNT}`,
-                details: { providedValue: amount, maximum: DECIMAL_LIMITS.MAX_AMOUNT },
-            };
-        }
+        this.emitDistributionEvent(report, input.requestId || '');
 
-        return { valid: true };
+        return report;
     }
 
     private emitDistributionEvent(report: RevenueReport, requestId: string): void {
-        // Placeholder for event emission logic
-        // This could be a message to a queue (e.g., RabbitMQ, Kafka) or a PubSub system
-        globalLogger.info(`Revenue report submitted for offering ${report.offering_id}. Triggering distribution engine...`, {
+        this.logger.info(`Revenue report submitted for offering ${report.offering_id}. Triggering distribution engine...`, {
+            requestId,
             reportId: report.id,
             offeringId: report.offering_id,
             amount: report.amount,
@@ -223,13 +157,4 @@ export class RevenueService {
             periodEnd: report.period_end,
         });
     }
-
-    // Generic fallback for unclassified errors
-    this.logger.error('Unclassified Stellar RPC error', { error });
-    return new AppError(
-      ErrorCode.INTERNAL_ERROR,
-      'An unexpected error occurred while interacting with the Stellar network.',
-      500
-    );
-  }
 }

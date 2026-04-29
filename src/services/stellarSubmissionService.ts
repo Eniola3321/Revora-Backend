@@ -1,7 +1,17 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { env } from '../config/env';
-import { globalLogger } from '../lib/logger';
+import { globalLogger, Logger } from '../lib/logger';
 import { Errors } from '../lib/errors';
+import { 
+  classifyStellarRPCFailure, 
+  StellarRPCFailure, 
+  StellarRPCFailureContext,
+  StellarRPCFailureClass,
+  shouldRetryStellarRPCFailure,
+  createStellarErrorResponse
+} from '../lib/stellarRpcFailure';
+
+const logger = globalLogger.child({ service: 'stellar-submission' });
 
 /**
  * Service for building and submitting Stellar transactions.

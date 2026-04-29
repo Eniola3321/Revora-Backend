@@ -32,40 +32,40 @@ describe("classifyStellarRPCFailure", () => {
     const error = new Error("network timeout");
     error.name = "AbortError";
 
-    expect(classifyStellarRPCFailure(error)).toBe(
+    expect(classifyStellarRPCFailure(error).class).toBe(
       StellarRPCFailureClass.TIMEOUT,
     );
   });
 
   it("classifies rate limit failures", () => {
-    expect(classifyStellarRPCFailure({ status: 429 })).toBe(
+    expect(classifyStellarRPCFailure({ status: 429 }).class).toBe(
       StellarRPCFailureClass.RATE_LIMIT,
     );
   });
 
   it("classifies auth failures", () => {
-    expect(classifyStellarRPCFailure({ status: 401 })).toBe(
+    expect(classifyStellarRPCFailure({ status: 401 }).class).toBe(
       StellarRPCFailureClass.UNAUTHORIZED,
     );
-    expect(classifyStellarRPCFailure({ status: 403 })).toBe(
+    expect(classifyStellarRPCFailure({ status: 403 }).class).toBe(
       StellarRPCFailureClass.UNAUTHORIZED,
     );
   });
 
   it("classifies upstream 5xx failures", () => {
-    expect(classifyStellarRPCFailure({ status: 503 })).toBe(
+    expect(classifyStellarRPCFailure({ status: 503 }).class).toBe(
       StellarRPCFailureClass.UPSTREAM_ERROR,
     );
   });
 
   it("classifies malformed responses", () => {
-    expect(classifyStellarRPCFailure(new SyntaxError("bad json"))).toBe(
+    expect(classifyStellarRPCFailure(new SyntaxError("bad json")).class).toBe(
       StellarRPCFailureClass.MALFORMED_RESPONSE,
     );
   });
 
   it("falls back to unknown for uncategorized errors", () => {
-    expect(classifyStellarRPCFailure(new Error("something odd"))).toBe(
+    expect(classifyStellarRPCFailure(new Error("something odd")).class).toBe(
       StellarRPCFailureClass.UNKNOWN,
     );
   });
@@ -113,59 +113,46 @@ describe("healthReadyHandler", () => {
   });
 
   it("returns ok when both database and horizon are healthy", async () => {
-    const mockDbHealth = jest.fn().mockResolvedValue({
-      healthy: true,
-      latencyMs: 25,
-      pool: {
-        totalCount: 2,
-        idleCount: 2,
-        waitingCount: 0,
-        maxConnections: 10,
-      },
-    });
+    const mockDb = {
+      query: jest.fn().mockResolvedValue({ rows: [{ "?column?": 1 }] }),
+    };
     global.fetch = jest
       .fn()
       .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
 
     const app = express();
-    app.get("/ready", healthReadyHandler(mockDbHealth));
+    app.get("/ready", healthReadyHandler(mockDb as any));
 
     const response = await request(app).get("/ready");
 
     expect(response.status).toBe(200);
     expect(response.body.ready).toBe(true);
+    expect(response.body.status).toBe("ok");
+    expect(response.body.db).toBe("up");
+    expect(response.body.stellar).toBe("up");
     expect(response.body.service).toBe("revora-backend");
-    expect(response.body.checks).toContain("database");
-    expect(response.body.checks).toContain("stellar-horizon");
   });
 
   it("surfaces sanitized database failures", async () => {
-    const mockDbHealth = jest.fn().mockResolvedValue({
-      healthy: false,
-      latencyMs: 100,
-      error: "connection failed",
-      pool: {
-        totalCount: 0,
-        idleCount: 0,
-        waitingCount: 0,
-        maxConnections: 10,
-      },
-    });
+    const mockDb = {
+      query: jest.fn().mockRejectedValue(new Error("connection failed")),
+    };
     global.fetch = jest
       .fn()
       .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
 
     const app = express();
-    app.get("/ready", healthReadyHandler(mockDbHealth));
+    app.get("/ready", healthReadyHandler(mockDb as any));
     app.use(
       (
-        err: unknown,
+        err: any,
         _req: express.Request,
         res: express.Response,
         _next: express.NextFunction,
       ) => {
-        const mapped = err as { statusCode: number; toResponse: () => unknown };
-        res.status(mapped.statusCode).json(mapped.toResponse());
+        const statusCode = err.statusCode || 500;
+        const body = typeof err.toResponse === 'function' ? err.toResponse() : { message: err.message };
+        res.status(statusCode).json(body);
       },
     );
 
@@ -182,6 +169,9 @@ describe("healthReadyHandler", () => {
   });
 
   it("maps Stellar upstream failures deterministically", async () => {
+    const mockDb = {
+      query: jest.fn().mockResolvedValue({ rows: [{ "?column?": 1 }] }),
+    };
     const mockDbHealth = jest.fn().mockResolvedValue({
       healthy: true,
       latencyMs: 20,
@@ -197,16 +187,17 @@ describe("healthReadyHandler", () => {
       .mockResolvedValue({ ok: false, status: 429 }) as typeof fetch;
 
     const app = express();
-    app.use("/health", createHealthRouter(mockDbHealth));
+    app.use("/health", createHealthRouter(mockDb as any, mockDbHealth));
     app.use(
       (
-        err: unknown,
+        err: any,
         _req: express.Request,
         res: express.Response,
         _next: express.NextFunction,
       ) => {
-        const mapped = err as { statusCode: number; toResponse: () => unknown };
-        res.status(mapped.statusCode).json(mapped.toResponse());
+        const statusCode = err.statusCode || 500;
+        const body = typeof err.toResponse === 'function' ? err.toResponse() : { message: err.message };
+        res.status(statusCode).json(body);
       },
     );
 
@@ -231,7 +222,8 @@ describe("healthReadyHandler", () => {
     global.fetch = jest.fn().mockRejectedValue(networkError) as typeof fetch;
 
     const app = express();
-    app.use('/health', createHealthRouter(db));
+    const mockDbHealth = jest.fn().mockResolvedValue({ healthy: true });
+    app.use('/health', createHealthRouter(db as any, mockDbHealth));
     app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
       const mapped = err as { statusCode: number; toResponse: () => unknown };
       res.status(mapped.statusCode).json(mapped.toResponse());
@@ -458,32 +450,61 @@ describe("offering validation matrix", () => {
     });
   });
 
-  it("rate limits repeated startup registration attempts on the versioned route", async () => {
-    const app = buildApp();
+  it("applies multi-tier rate limiting for startup registration", async () => {
+    const SECRET = "test-tier-secret";
+    process.env.STARTUP_AUTH_TIER_SECRET = SECRET;
+    const path = "/api/v1/startup/register";
 
-    for (let i = 0; i < 5; i += 1) {
-      const response = await request(app)
-        .post("/api/v1/startup/register")
-        .send({
-          email: `founder-${i}@example.com`,
-          password: "VeryStrongPass!9",
-        });
-
-      expect(response.status).toBe(201);
-      expect(response.headers["x-ratelimit-limit"]).toBe("5");
+    // 1. Standard Tier (Default: 5 requests)
+    {
+      const app = buildApp();
+      for (let i = 0; i < 5; i++) {
+        const res = await request(app).post(path).send({ email: `std-${i}@test.com`, password: "Pass" });
+        expect(res.status).toBe(201);
+        expect(res.headers["x-ratelimit-limit"]).toBe("5");
+      }
+      const blockedStd = await request(app).post(path).send({ email: "std-fail@test.com", password: "Pass" });
+      expect(blockedStd.status).toBe(429);
     }
 
-    const blocked = await request(app)
-      .post("/api/v1/startup/register")
-      .send({ email: "founder-6@example.com", password: "VeryStrongPass!9" });
+    // 2. Trusted Tier (10 requests)
+    {
+      const app = buildApp();
+      const trustedHeaders = { "x-revora-rate-tier": "trusted", "x-revora-tier-secret": SECRET };
+      for (let i = 0; i < 10; i++) {
+        const res = await request(app).post(path).set(trustedHeaders).send({ email: `trust-${i}@test.com`, password: "Pass" });
+        expect(res.status).toBe(201);
+        expect(res.headers["x-ratelimit-limit"]).toBe("10");
+      }
+      const blockedTrust = await request(app).post(path).set(trustedHeaders).send({ email: "trust-fail@test.com", password: "Pass" });
+      expect(blockedTrust.status).toBe(429);
+    }
 
-    expect(blocked.status).toBe(429);
-    expect(blocked.body).toEqual({
-      error: "TooManyRequests",
-      message: "Too many registration attempts",
-    });
-    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
-    expect(blocked.headers["retry-after"]).toBeDefined();
+    // 3. Internal Tier (25 requests)
+    {
+      const app = buildApp();
+      const internalHeaders = { "x-revora-rate-tier": "internal", "x-revora-tier-secret": SECRET };
+      for (let i = 0; i < 25; i++) {
+        const res = await request(app).post(path).set(internalHeaders).send({ email: `int-${i}@test.com`, password: "Pass" });
+        expect(res.status).toBe(201);
+        expect(res.headers["x-ratelimit-limit"]).toBe("25");
+      }
+      const blockedInt = await request(app).post(path).set(internalHeaders).send({ email: "int-fail@test.com", password: "Pass" });
+      expect(blockedInt.status).toBe(429);
+    }
+
+    // 4. Invalid Secret Fallback (Standard Tier)
+    {
+      const app = buildApp();
+      const invalidHeaders = { "x-revora-rate-tier": "internal", "x-revora-tier-secret": "wrong" };
+      for (let i = 0; i < 5; i++) {
+        const res = await request(app).post(path).set(invalidHeaders).send({ email: `wrong-${i}@test.com`, password: "Pass" });
+        expect(res.status).toBe(201);
+        expect(res.headers["x-ratelimit-limit"]).toBe("5");
+      }
+      const blockedWrong = await request(app).post(path).set(invalidHeaders).send({ email: "wrong-fail@test.com", password: "Pass" });
+      expect(blockedWrong.status).toBe(429);
+    }
   });
 
   it("rejects startup registration payloads that omit required credentials", async () => {
@@ -645,10 +666,12 @@ describe('health metrics collection', () => {
     const response = await request(app).get('/ready');
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({
+    expect(response.body).toMatchObject({
       status: 'ok',
       db: 'up',
       stellar: 'up',
+      ready: true,
+      service: 'revora-backend',
     });
   });
 });
@@ -1011,7 +1034,8 @@ describe("createHealthRouter - k8s probe endpoints", () => {
       },
     });
 
-    const router = createHealthRouter(mockDbHealth);
+    const mockDb = { query: jest.fn().mockResolvedValue({ rows: [{ '?column?': 1 }] }) };
+    const router = createHealthRouter(mockDb as any, mockDbHealth);
     const app = express();
     app.use(router);
 

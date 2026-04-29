@@ -12,7 +12,11 @@ import { DistributionRepository, DistributionRun, Payout } from '../db/repositor
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { logger } from '../lib/logger';
-import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+import { 
+  classifyStellarRPCFailure, 
+  StellarRPCFailureClass,
+  StellarRPCFailureContext 
+} from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
 
 export interface OnChainRevenueState {
@@ -165,18 +169,21 @@ export class RevenueReconciliationService {
           });
         }
       } catch (error) {
-        const failureClass = classifyStellarRPCFailure(error);
+        const failure = classifyStellarRPCFailure(error, {
+          operation: 'detectChainDrift',
+          offeringId,
+        });
         discrepancies.push({
           type: 'RPC_ERROR',
           severity: 'warning',
-          message: `Failed to fetch on-chain state: ${failureClass}`,
-          details: { error: String(error), failureClass },
+          message: `Failed to fetch on-chain state: ${failure.class}`,
+          details: { error: String(error), failureClass: failure.class },
           offeringId,
         });
 
         logger.warn('Failed to fetch on-chain state during reconciliation', {
           offeringId,
-          failureClass,
+          failureClass: failure.class,
           error: String(error),
         });
       }
@@ -273,25 +280,28 @@ export class RevenueReconciliationService {
           );
           discrepancies.push(...chainEventChecks);
         } catch (error) {
-          const failureClass = classifyStellarRPCFailure(error);
+          const failure = classifyStellarRPCFailure(error, {
+            operation: 'validateChainEventConsistency',
+            offeringId,
+          });
           this.logger?.warn(
             'Failed to validate chain event consistency',
             {
               offeringId,
-              failureClass,
+              failureClass: failure.class,
               error: error instanceof Error ? error.message : 'Unknown error',
             },
             LogLevel.WARN
           );
           
-          if (failureClass !== StellarRPCFailureClass.UNKNOWN) {
+          if (failure.class !== StellarRPCFailureClass.UNKNOWN) {
             discrepancies.push({
               type: 'CHAIN_EVENT_VALIDATION_FAILED',
               severity: 'warning',
-              message: `Chain event validation failed due to ${failureClass}`,
+              message: `Chain event validation failed due to ${failure.class}`,
               details: {
                 offeringId,
-                failureClass,
+                failureClass: failure.class,
                 error: error instanceof Error ? error.message : 'Unknown error',
               },
               offeringId,

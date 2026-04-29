@@ -1,6 +1,11 @@
-import { globalLogger } from '../lib/logger';
+import { Logger, globalLogger } from '../lib/logger';
 import { Errors } from '../lib/errors';
-import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+import { 
+  classifyStellarRPCFailure, 
+  StellarRPCFailureClass,
+  StellarRPCFailure,
+  StellarRPCFailureContext 
+} from '../lib/stellarRpcFailure';
 
 /**
  * @title DistributionEngine
@@ -11,10 +16,14 @@ import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
  * 3. Rounding adjustment to ensure total payout equals revenue amount
  * 4. Persistence of distribution runs and individual payouts with a retry strategy
  * 5. Batch processing for large payout sets with partial failure handling
+ * 
+ * **Security Assumptions & Risk Notes:**
+ * - **Trust Boundary**: Balance data is assumed to be validated by the provided `balanceProvider` or `offeringRepo`.
+ * - **Idempotency**: Runs are keyed by `(offeringId, periodId, totalAmount)`. Multiple calls with same params will resume or return existing run.
+ * - **Data Leakage**: Stellar RPC failures are classified via `classifyStellarRPCFailure` to ensure raw upstream error strings do not leak to client.
+ * - **Transactionality**: Payouts are persisted individually within batches. Partial failures are recorded in the `distribution_run` status.
+ * - **Rounding**: The "Max Share Adjustment" strategy is used to ensure total payouts exactly match `revenueAmount` to the cent, preventing minor leakage or shortfall.
  */
-
-import { Logger, globalLogger } from '../lib/logger';
-import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
 
 export interface BalanceRow {
   investor_id: string;
@@ -86,6 +95,15 @@ export class DistributionEngine {
     revenueAmount: number
   ): Promise<DistributionResult> {
     const result = await this.distributeWithBatch(offeringId, period, revenueAmount);
+    
+    if (result.failedPayouts.length > 0) {
+      const firstFailure = result.failedPayouts[0];
+      const errorMsg = firstFailure.errorClass 
+        ? `Distribution failed: ${firstFailure.errorClass}`
+        : 'Distribution completed with partial failures';
+      throw Errors.internal(errorMsg);
+    }
+
     // Backward compatibility: return original shape
     return {
       distributionRun: result.distributionRun,
@@ -121,14 +139,25 @@ export class DistributionEngine {
     
     if (run) {
       if (run.status === 'completed') {
-        logger.info('Distribution already completed, returning cached results');
+        this.logger.info('Distribution already completed, returning cached results', {
+          offeringId,
+          periodId: period.id,
+          runId: run.id,
+        });
         const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
         return {
           distributionRun: run,
-          payouts: existingPayouts.map((p: any) => ({ investor_id: p.investor_id, amount: p.amount })),
+          successfulPayouts: existingPayouts.map((p: any) => ({ investor_id: p.investor_id, amount: p.amount })),
+          failedPayouts: [],
+          totalPayouts: existingPayouts.length,
         };
       }
-      logger.info('Resuming partially completed distribution', { runId: run.id, currentStatus: run.status });
+      this.logger.info('Resuming partially completed distribution', {
+        offeringId,
+        periodId: period.id,
+        runId: run.id,
+        currentStatus: run.status
+      });
     }
 
     // 3. Acquire balances with retry and classification
@@ -136,9 +165,18 @@ export class DistributionEngine {
     try {
       balances = await this.withRetry(() => this.fetchBalances(offeringId, period));
     } catch (err) {
-      const failureClass = classifyStellarRPCFailure(err);
-      logger.error('Failed to acquire balances', { error: err, failureClass });
-      throw Errors.serviceUnavailable(`Failed to acquire balances (${failureClass}): ${err instanceof Error ? err.message : String(err)}`);
+      const failure = classifyStellarRPCFailure(err, {
+        operation: 'fetchBalances',
+        offeringId,
+        periodId: period.id,
+      });
+      this.logger.error('Failed to acquire balances', {
+        offeringId,
+        periodId: period.id,
+        error: err instanceof Error ? err.message : String(err),
+        failureClass: failure.class
+      });
+      throw Errors.serviceUnavailable(`Failed to acquire balances: ${failure.class}`);
     }
 
     if (!balances || balances.length === 0) {
@@ -184,13 +222,42 @@ export class DistributionEngine {
             status: 'processing',
           })
         );
-        logger.info('Created new distribution run', { runId: run.id });
+        this.logger.info('Created new distribution run', {
+          offeringId,
+          periodId: period.id,
+          runId: run.id
+        });
       } catch (err) {
-        logger.error('Failed to create distribution run', { error: err });
-        throw Errors.internal('Failed to initialize distribution run');
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'createDistributionRun',
+          offeringId,
+          periodId: period.id,
+        });
+        this.logger.error('Failed to create distribution run', {
+          offeringId,
+          periodId: period.id,
+          error: err instanceof Error ? err.message : String(err),
+          failureClass: failure.class
+        });
+        throw Errors.internal(`Failed to initialize distribution run: ${failure.class}`);
       }
     } else if (run.status !== 'processing') {
-      await this.distributionRepo.updateRunStatus(run.id, 'processing');
+      try {
+        await this.distributionRepo.updateRunStatus(run.id, 'processing');
+      } catch (err) {
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'updateRunStatus',
+          offeringId,
+          periodId: period.id,
+        });
+        this.logger.error('Failed to update run status to processing', {
+          offeringId,
+          runId: run.id,
+          error: err instanceof Error ? err.message : String(err),
+          failureClass: failure.class
+        });
+        throw Errors.internal(`Failed to update distribution status: ${failure.class}`);
+      }
     }
 
     this.logger.info('Distribution batch started', {
@@ -203,8 +270,15 @@ export class DistributionEngine {
     });
 
     // 6. Process payouts in batches with partial failure tracking
-    const successfulPayouts: Array<{ investor_id: string; amount: string }> = [];
+    const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
+    const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
+
+    const successfulPayouts: Array<{ investor_id: string; amount: string }> = existingPayouts.map((p: any) => ({
+      investor_id: p.investor_id,
+      amount: p.amount,
+    }));
     const failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }> = [];
+    let hasBatchFailure = false;
 
     for (let batchStart = 0; batchStart < rounded.length; batchStart += this.batchSize) {
       const batch = rounded.slice(batchStart, batchStart + this.batchSize);
@@ -212,6 +286,10 @@ export class DistributionEngine {
 
       try {
         for (const r of batch) {
+          if (existingInvestorIds.has(r.investor_id)) {
+            continue;
+          }
+
           const amtStr = r.amount.toFixed(2);
           try {
             await this.withRetry(() =>
@@ -224,40 +302,72 @@ export class DistributionEngine {
             );
             successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
           } catch (err) {
-            const errorClass = classifyStellarRPCFailure(err);
-            const errorMessage = err instanceof Error ? err.message : String(err);
+            const failure = classifyStellarRPCFailure(err, {
+              operation: 'createPayout',
+              offeringId,
+              periodId: period.id,
+            });
             
             this.logger.error('Payout creation failed', {
               offeringId,
               runId: run.id,
               investorId: r.investor_id,
-              errorClass,
+              errorClass: failure.class,
               batchNumber,
+              // Log raw error internally but don't expose it in the result
+              rawError: err instanceof Error ? err.message : String(err),
             });
 
             failedPayouts.push({
               investor_id: r.investor_id,
               amount: amtStr,
-              error: errorMessage,
-              errorClass,
+              error: `Action failed with ${failure.class}`,
+              errorClass: failure.class,
             });
           }
         }
       } catch (err) {
+        hasBatchFailure = true;
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'processBatch',
+          offeringId,
+          periodId: period.id,
+        });
         this.logger.error('Payout batch failed', {
           offeringId,
           runId: run.id,
           batchNumber,
-          errorClass: classifyStellarRPCFailure(err),
+          errorClass: failure.class,
           investorCount: batch.length,
         });
       }
     }
 
     const duration = Date.now() - startTime;
+    const finalStatus = (failedPayouts.length === 0 && !hasBatchFailure) ? 'completed' : 'failed';
+    
+    try {
+      await this.distributionRepo.updateRunStatus(run.id, finalStatus);
+      run.status = finalStatus;
+    } catch (err) {
+      const failure = classifyStellarRPCFailure(err, {
+        operation: 'updateFinalRunStatus',
+        offeringId,
+        periodId: period.id,
+      });
+      this.logger.error('Failed to update final distribution run status', {
+        offeringId,
+        runId: run.id,
+        finalStatus,
+        error: err instanceof Error ? err.message : String(err),
+        failureClass: failure.class
+      });
+    }
+
     this.logger.info('Distribution batch completed', {
       offeringId,
       runId: run.id,
+      status: finalStatus,
       successfulPayouts: successfulPayouts.length,
       failedPayouts: failedPayouts.length,
       totalPayouts: rounded.length,

@@ -9,6 +9,8 @@ import { Errors } from './lib/errors';
 import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellarRpcFailure';
 import { createHealthRouter } from './routes/health';
 import vestingRouter from './routes/vesting';
+import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
+import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
 
 const port = process.env.PORT ?? 3000;
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? "/api/v1";
@@ -609,7 +611,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     });
   });
 
-  app.use("/health", createHealthRouter(healthStatus));
+  app.use("/health", createHealthRouter(healthQuery as any, healthStatus));
 
   apiRouter.get("/overview", (_req: Request, res: Response) => {
     res.json({
@@ -622,7 +624,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   apiRouter.post(
     "/startup/register",
-    createStartupRegisterLimiter(),
+    createStartupAuthTierLimiter().middleware,
     createStartupRegisterHandler(),
   );
 

@@ -10,6 +10,7 @@ import {
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
+  StellarRPCFailureContext
 } from '../lib/stellarRpcFailure';
 import { Logger, globalLogger } from '../lib/logger';
 
@@ -66,10 +67,14 @@ export class RealStellarClient implements StellarClient {
 
       return state;
     } catch (error) {
+      const failure = classifyStellarRPCFailure(error, {
+        operation: 'getOfferingState',
+        offeringId: contractAddress, // using contractAddress as context
+      });
       this.logger.error('Failed to fetch offering state', {
         contractAddress,
         error: error instanceof Error ? error.message : String(error),
-        failureClass: classifyStellarRPCFailure(error),
+        failureClass: failure.class,
       });
       throw error;
     }

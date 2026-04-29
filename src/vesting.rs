@@ -1,13 +1,18 @@
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Vec};
 
+/// Storage keys used by the contract.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StorageKey {
+    /// The address of the contract administrator.
     Admin,
+    /// Vesting schedule for a beneficiary.
     Vesting(Address),
+    /// Claim history for a beneficiary.
     Claims(Address),
 }
 
+/// Event emitted when a new vesting schedule is created.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VestingCreatedEvent {
@@ -19,6 +24,7 @@ pub struct VestingCreatedEvent {
     pub timestamp: u64,
 }
 
+/// Event emitted when a partial claim is made.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialClaimEvent {
@@ -28,6 +34,7 @@ pub struct PartialClaimEvent {
     pub total_claimed: i128,
 }
 
+/// Internal representation of a vesting schedule.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VestingSchedule {
@@ -38,6 +45,7 @@ pub struct VestingSchedule {
     pub claimed: i128,
 }
 
+/// Internal representation of a partial claim entry.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialClaim {
@@ -46,17 +54,32 @@ pub struct PartialClaim {
     pub total_claimed: i128,
 }
 
+/// The Vesting Contract allows administrators to create vesting schedules
+/// and beneficiaries to claim their vested tokens over time.
 #[contract]
 pub struct VestingContract;
 
 #[contractimpl]
 impl VestingContract {
     /// Initializes the vesting contract admin.
+    /// 
+    /// # Arguments
+    /// * `admin` - The address to be set as the contract administrator.
     pub fn initialize(env: Env, admin: Address) {
         env.storage().instance().set(&StorageKey::Admin, &admin);
     }
 
     /// Creates a vesting schedule for a beneficiary.
+    /// 
+    /// # Arguments
+    /// * `beneficiary` - The address of the beneficiary.
+    /// * `total_amount` - The total number of tokens to be vested.
+    /// * `start_time` - The timestamp when vesting begins.
+    /// * `cliff_time` - The timestamp after which the first tokens can be claimed.
+    /// * `end_time` - The timestamp when all tokens are fully vested.
+    /// 
+    /// # Security
+    /// Only the administrator can call this function.
     pub fn create_vesting(
         env: Env,
         beneficiary: Address,
@@ -113,6 +136,13 @@ impl VestingContract {
     }
 
     /// Claims vested tokens for a beneficiary.
+    /// 
+    /// # Arguments
+    /// * `beneficiary` - The address of the beneficiary.
+    /// * `amount` - The number of tokens to claim.
+    /// 
+    /// # Security
+    /// The beneficiary must authorize the call.
     pub fn claim(env: Env, beneficiary: Address, amount: i128) {
         beneficiary.require_auth();
 
@@ -144,7 +174,7 @@ impl VestingContract {
             None => Vec::new(&env),
         };
 
-        if claims.len() > 0 {
+        if !claims.is_empty() {
             let last_claim = claims
                 .get(claims.len() - 1)
                 .expect("Claim ledger is missing its last entry");
@@ -209,9 +239,7 @@ impl VestingContract {
     pub(crate) fn calculate_vested(schedule: &VestingSchedule, current_time: u64) -> i128 {
         if current_time < schedule.cliff_time {
             0
-        } else if schedule.cliff_time == schedule.end_time {
-            schedule.total_amount
-        } else if current_time >= schedule.end_time {
+        } else if current_time >= schedule.end_time || schedule.cliff_time == schedule.end_time {
             schedule.total_amount
         } else {
             let elapsed = current_time - schedule.cliff_time;

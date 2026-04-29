@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
+import { globalLogger as logger } from '../lib/logger';
 
 export interface OfferingRepo {
   getById: (id: string) => Promise<Offering | null>;
@@ -12,6 +13,7 @@ export interface Offering {
 
 export function createDistributionHandlers(distributionEngine: any, offeringRepo?: OfferingRepo) {
   async function triggerDistribution(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
     try {
       const user = (req as any).user;
       if (!user || !user.id) {
@@ -22,6 +24,13 @@ export function createDistributionHandlers(distributionEngine: any, offeringRepo
       if (!offeringId) {
         throw Errors.badRequest('Missing offering id');
       }
+
+      logger.info('Triggering distribution', {
+        offeringId,
+        userId: user.id,
+        role: user.role,
+        requestId,
+      });
 
       const revenueRaw = req.body?.revenue_amount ?? req.body?.revenueAmount;
       const revenueAmount = revenueRaw !== undefined ? Number(revenueRaw) : NaN;
@@ -68,7 +77,12 @@ export function createDistributionHandlers(distributionEngine: any, offeringRepo
       const result = await distributionEngine.distribute(offeringId, period, revenueAmount);
 
       // Return summary with structured response
-      const requestId = (req as any).id;
+      logger.info('Distribution triggered successfully', {
+        offeringId,
+        runId: result.distributionRun?.id,
+        payoutCount: result.payouts?.length,
+        requestId,
+      });
       return res.status(200).json({
         run_id: result.distributionRun?.id,
         payouts: result.payouts,
@@ -76,6 +90,11 @@ export function createDistributionHandlers(distributionEngine: any, offeringRepo
         requestId,
       });
     } catch (err) {
+      logger.error('Distribution trigger failed', {
+        offeringId: req.params.id,
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
       return next(err);
     }
   }

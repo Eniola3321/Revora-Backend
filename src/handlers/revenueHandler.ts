@@ -1,7 +1,9 @@
 import { Response, NextFunction } from 'express';
 import { RevenueService } from '../services/revenueService';
 import { AuthenticatedRequest } from '../middleware/auth';
-import { Errors } from '../lib/errors';
+import { AppError, Errors } from '../lib/errors';
+import { Logger } from '../lib/logger';
+import { LogLevel } from '../lib/logger';
 
 /**
  * RevenueHandler: HTTP request handler for revenue reporting operations.
@@ -92,7 +94,75 @@ export class RevenueHandler {
                 data: report,
             });
         } catch (error) {
-            next(error);
+            if (error instanceof AppError) {
+                next(error);
+            } else {
+                this.logger.error('Unexpected error during revenue report submission', { error });
+                next(Errors.internal('Internal server error'));
+            }
+        }
+    };
+
+    /**
+     * Handle POST /offerings/revenue
+     *
+     * Submits a revenue report by specifying offeringId in the request body.
+     */
+    submitReportByBody = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+        try {
+            const requestId = req.requestId;
+            const issuerId = req.user?.id;
+
+            if (!issuerId) {
+                return next(Errors.unauthorized('User not authenticated'));
+            }
+
+            const { offeringId, amount, periodStart, periodEnd } = req.body;
+
+            if (!offeringId) {
+                return next(Errors.validationError('Missing required field: offeringId'));
+            }
+
+            if (!amount || !periodStart || !periodEnd) {
+                return next(Errors.validationError('Missing required fields: amount, periodStart, periodEnd'));
+            }
+
+            this.logger.info('Processing revenue report submission by body', {
+                requestId,
+                offeringId,
+                issuerId,
+                amount,
+                periodStart,
+                periodEnd,
+            });
+
+            const report = await this.revenueService.submitReport({
+                offeringId,
+                issuerId,
+                amount,
+                periodStart: new Date(periodStart),
+                periodEnd: new Date(periodEnd),
+                requestId,
+            });
+
+            this.logger.info('Revenue report submitted successfully', {
+                requestId,
+                reportId: report.id,
+                offeringId,
+                issuerId,
+            });
+
+            res.status(201).json({
+                message: 'Revenue report submitted successfully',
+                data: report,
+            });
+        } catch (error) {
+            if (error instanceof AppError) {
+                next(error);
+            } else {
+                this.logger.error('Unexpected error during revenue report submission by body', { error });
+                next(Errors.internal('Internal server error'));
+            }
         }
     };
 }
