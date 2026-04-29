@@ -1,6 +1,11 @@
 /**
  * @dev Stable classification for failures returned by Stellar-facing dependencies.
  * Raw upstream messages must never cross the API trust boundary.
+ * 
+ * **Security Assumptions:**
+ * - **Error Masking**: This utility is the primary defense against internal information leakage via error messages.
+ * - **Deterministic Mapping**: Every error, even if unknown, is mapped to a `StellarRPCFailureClass` to prevent raw stacks or messages from being returned to the user.
+ * - **Retry Safety**: Only failures explicitly marked as `shouldRetry` (like TIMEOUT or RATE_LIMIT) should trigger automated retries.
  */
 export enum StellarRPCFailureClass {
   TIMEOUT = 'TIMEOUT',
@@ -8,11 +13,41 @@ export enum StellarRPCFailureClass {
   UPSTREAM_ERROR = 'UPSTREAM_ERROR',
   MALFORMED_RESPONSE = 'MALFORMED_RESPONSE',
   UNAUTHORIZED = 'UNAUTHORIZED',
+  NETWORK_ERROR = 'NETWORK_ERROR',
+  VALIDATION_ERROR = 'VALIDATION_ERROR',
+  INSUFFICIENT_FUNDS = 'INSUFFICIENT_FUNDS',
+  TRANSACTION_FAILED = 'TRANSACTION_FAILED',
+  CONTRACT_ERROR = 'CONTRACT_ERROR',
+  BAD_SEQUENCE = 'BAD_SEQUENCE',
+  SIGNING_ERROR = 'SIGNING_ERROR',
   /** Transaction-level result code from Horizon (e.g. tx_bad_seq, tx_insufficient_fee). */
   TX_RESULT_CODE = 'TX_RESULT_CODE',
   /** Operation-level result code from Horizon (e.g. op_no_destination, op_underfunded). */
   OP_RESULT_CODE = 'OP_RESULT_CODE',
   UNKNOWN = 'UNKNOWN',
+}
+
+/**
+ * @dev Context for Stellar RPC failures to assist in retry logic and logging.
+ */
+export interface StellarRPCFailureContext {
+  operation: string;
+  offeringId?: string;
+  periodId?: string;
+  requestId?: string;
+  attemptCount?: number;
+}
+
+/**
+ * @dev Structured representation of a Stellar RPC failure.
+ */
+export interface StellarRPCFailure {
+  class: StellarRPCFailureClass;
+  context: StellarRPCFailureContext;
+  originalError: any;
+  timestamp: string;
+  shouldRetry: boolean;
+  suggestedRetryDelayMs?: number;
 }
 
 /**
@@ -70,7 +105,7 @@ export const STELLAR_OP_RESULT_CODES = new Set([
  */
 export function classifyStellarRPCFailure(
   error: unknown,
-  context: StellarRPCFailureContext
+  context: StellarRPCFailureContext = { operation: 'unknown' }
 ): StellarRPCFailure {
   const timestamp = new Date().toISOString();
   
@@ -114,7 +149,7 @@ export function classifyStellarRPCFailure(
   // HTTP status code based classification
   if (typeof error === 'object' && error !== null) {
     const err = error as Record<string, unknown>;
-    const status = err['status'] as number | undefined;
+    const status = (err['status'] || err['statusCode'] || err['httpCode']) as number | undefined;
 
     // ── Stellar Horizon result-code envelope ────────────────────────────────
     // Horizon wraps protocol errors in { extras: { result_codes: { transaction, operations } } }
@@ -127,17 +162,55 @@ export function classifyStellarRPCFailure(
 
       // Operation-level codes take precedence for actionability
       if (Array.isArray(opCodes) && opCodes.some((c) => STELLAR_OP_RESULT_CODES.has(c))) {
-        return StellarRPCFailureClass.OP_RESULT_CODE;
+        return {
+          class: StellarRPCFailureClass.OP_RESULT_CODE,
+          context,
+          originalError: sanitizeError(error),
+          timestamp,
+          shouldRetry: false, // Protocol errors usually shouldn't be retried
+        };
       }
       if (typeof txCode === 'string' && STELLAR_TX_RESULT_CODES.has(txCode)) {
-        return StellarRPCFailureClass.TX_RESULT_CODE;
+        return {
+          class: StellarRPCFailureClass.TX_RESULT_CODE,
+          context,
+          originalError: sanitizeError(error),
+          timestamp,
+          shouldRetry: false, // Protocol errors usually shouldn't be retried
+        };
       }
     }
 
     // ── HTTP status codes ───────────────────────────────────────────────────
-    if (status === 429) return StellarRPCFailureClass.RATE_LIMIT;
-    if (status === 401 || status === 403) return StellarRPCFailureClass.UNAUTHORIZED;
-    if (typeof status === 'number' && status >= 500) return StellarRPCFailureClass.UPSTREAM_ERROR;
+    if (status === 429) {
+      return {
+        class: StellarRPCFailureClass.RATE_LIMIT,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: true,
+        suggestedRetryDelayMs: extractRetryAfter(error) || 10000,
+      };
+    }
+    if (status === 401 || status === 403) {
+      return {
+        class: StellarRPCFailureClass.UNAUTHORIZED,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: false,
+      };
+    }
+    if (typeof status === 'number' && status >= 500) {
+      return {
+        class: StellarRPCFailureClass.UPSTREAM_ERROR,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: true,
+        suggestedRetryDelayMs: 5000,
+      };
+    }
   }
 
   // Stellar-specific transaction errors with enhanced detection

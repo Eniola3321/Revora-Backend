@@ -93,9 +93,6 @@ export const errorHandler: ErrorRequestHandler = (
     });
   }
 
-  const body: ErrorResponse = mapped.expose
-    ? mapped.toResponse(requestId)
-    : Errors.internal().toResponse(requestId);
-
-  res.status(mapped.statusCode).json(body);
+  const finalError = mapped.expose ? mapped : Errors.internal();
+  res.status(finalError.statusCode).json(finalError.toResponse(requestId));
 };

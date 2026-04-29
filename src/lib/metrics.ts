@@ -540,6 +540,23 @@ export class MetricsCollector {
       });
     }
 
+    // Export histograms (as summary points for JSON)
+    for (const [key, observations] of this.histograms.entries()) {
+      const { name, labels } = this.parseMetricKey(key);
+      const metadata = this.metricMetadata.get(name);
+      const data = this.calculateHistogram(observations);
+      
+      // We export the sum as the primary value for the MetricPoint
+      points.push({
+        name,
+        type: MetricType.HISTOGRAM,
+        value: data.sum,
+        timestamp,
+        labels,
+        help: metadata?.help,
+      });
+    }
+
     return points;
   }
 
