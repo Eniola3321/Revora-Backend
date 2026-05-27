@@ -11,9 +11,10 @@ import { createHealthRouter } from './routes/health';
 import vestingRouter from './routes/vesting';
 import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
 import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
+import { env } from './config/env';
 
-const port = process.env.PORT ?? 3000;
-const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? "/api/v1";
+const port = env.PORT;
+const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
 
 const OFFERING_ROLES = ["startup", "admin", "compliance", "investor"] as const;
 const OFFERING_ACTIONS = [
@@ -600,7 +601,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   app.set("trust proxy", 1);
   app.use(createCorsMiddleware() as RequestHandler);
   app.use(express.json({ limit: "32kb" }));
-  app.use(morgan(process.env.NODE_ENV === "test" ? "tiny" : "dev"));
+  app.use(morgan(env.NODE_ENV === "test" ? "tiny" : "dev"));
 
   app.get("/health", async (_req: Request, res: Response) => {
     const db = await healthStatus();
@@ -727,7 +728,7 @@ export class WebhookQueue {
 }
 
 /* istanbul ignore next -- bootstrapping is integration-environment specific */
-if (require.main === module && process.env.NODE_ENV !== "test") {
+if (require.main === module && env.NODE_ENV !== "test") {
   process.on("SIGTERM", () => {
     void shutdown("SIGTERM");
   });
